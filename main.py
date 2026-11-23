@@ -3,6 +3,8 @@
 """Claude 控制台 —— 在桌面窗口中与 Claude Code 对话。"""
 
 import asyncio
+import difflib
+import html
 import json
 import os
 import re
@@ -21,25 +23,27 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
 
 from PyQt5.QtCore import (QBuffer, QByteArray, QDir, QEvent, QIODevice, QObject,
-                          QProcess, QRect, QSize, QSortFilterProxyModel,
+                          QPoint, QProcess, QRect, QSize, QSortFilterProxyModel,
                           QStringListModel, Qt, QThread, QTimer, QUrl,
                           pyqtSignal)
 from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics,
-                         QIcon, QImage, QKeySequence, QPainter, QPixmap,
-                         QSyntaxHighlighter, QTextCharFormat, QTextCursor,
-                         QTextFormat)
+                         QGuiApplication, QIcon, QImage, QKeySequence, QPainter,
+                         QPixmap, QSyntaxHighlighter, QTextCharFormat,
+                         QTextCursor, QTextFormat)
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                              QCompleter, QDialog, QFileDialog, QFormLayout,
                              QFrame, QFileSystemModel, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                             QPlainTextEdit, QProgressBar, QPushButton,
-                             QScrollArea, QShortcut, QSpinBox, QSplitter,
-                             QStackedWidget, QTabWidget, QTextBrowser,
-                             QTextEdit, QToolButton, QTreeView, QVBoxLayout,
+                             QListWidgetItem, QListView, QMainWindow, QMenu,
+                             QMessageBox, QPlainTextEdit, QProgressBar,
+                             QPushButton, QScrollArea, QShortcut, QSpinBox,
+                             QSplitter, QStackedWidget, QTabWidget,
+                             QTextBrowser, QTextEdit, QToolButton, QTreeView,
+                             QTreeWidget, QTreeWidgetItem, QVBoxLayout,
                              QWidget)
 
 import agent_shared as shared_agents
+import background_monitor
 import image_ocr
 
 # --------------------------------------------------------------------------- #
@@ -69,8 +73,26 @@ warnings.filterwarnings("ignore", message="can_use_tool will not be invoked.*")
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "claude-console"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STUDY_DIR = CONFIG_DIR / "studies"
+DEV_RECORDS_DIR = CONFIG_DIR / "dev_records"
 ICON_PATH = BASE_DIR / "icon.png"
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+
+# Claude CLI 以 NDJSON 往 stdout 写消息，SDK 默认只给单条消息 1 MiB 缓冲。
+# 粘贴截图（base64）、读取大文件或大段工具输出时，单条消息会超过 1 MiB，
+# SDK 就会抛 CLIJSONDecodeError 并把整轮对话判为连接失败。这里放宽到 64 MiB，
+# 仍然有上限，避免异常输出把内存吃光。
+def _cli_max_buffer_bytes():
+    raw = os.environ.get("CLAUDE_CONSOLE_MAX_BUFFER_MB", "")
+    try:
+        mb = int(raw)
+    except ValueError:
+        mb = 0
+    if mb <= 0:
+        mb = 64
+    return mb * 1024 * 1024
+
+
+MAX_CLI_MESSAGE_BYTES = _cli_max_buffer_bytes()
 
 DEFAULT_CONFIG = {
     "projects": [],
@@ -80,6 +102,9 @@ DEFAULT_CONFIG = {
     "permission_mode": "default",
     "model": "",
     "effort": "high",
+    # 代码开发页：允许修改的文件夹与修改模式
+    "dev_roots": [],
+    "dev_mode": "function",
     # 技能分类：{技能目录名: 分类}，可在技能库右键修改
     "skill_categories": {},
 }
@@ -191,6 +216,14 @@ TOOL_LABELS = {
     "TodoWrite": "任务清单",
     "Task": "子任务",
     "NotebookEdit": "编辑笔记本",
+}
+
+# 开发模式：会改动文件的工具，以及无需询问的只读工具
+DEV_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+DEV_READ_ONLY_TOOLS = {
+    "Read", "Grep", "Glob", "LS", "BashOutput", "WebFetch", "WebSearch",
+    "TodoWrite", "NotebookRead", "ListMcpResourcesTool", "ReadMcpResourceTool",
+    "ExitPlanMode",
 }
 
 _claude_cache = {"done": False, "path": None}
@@ -811,6 +844,8 @@ class ClaudeWorker(QObject):
     error = pyqtSignal(str)
     busy_changed = pyqtSignal(bool)
     permission_asked = pyqtSignal(int, str, str)
+    # 开发模式附加信息：(请求号, 目标路径, 是否位于允许修改的文件夹之外)
+    permission_detail = pyqtSignal(int, str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -828,6 +863,27 @@ class ClaudeWorker(QObject):
         self._perm_seq = 0
         self._pending = {}
         self._pending_lock = threading.Lock()
+        # 开发模式：允许修改的文件夹、修改模式、每轮是否已授权、
+        # 本轮写文件前的原始内容（用于改前/改后对比）
+        self._dev_roots = []
+        self._dev_mode = ""
+        self._dev_turn_auto = False
+        self._dev_approved_files = set()
+        self._dev_deny_writes = False
+        self._dev_pre_images = {}
+        self._dev_lock = threading.Lock()
+        self._dev_perm_context = {}
+        # 进度查询：记录本轮开始/最近活动/工具/权限等待，供界面只读快照
+        self._status_lock = threading.Lock()
+        self._turn_started = None
+        self._last_activity = None
+        self._last_activity_label = ""
+        self._tool_count = 0
+        self._last_tool = ""
+        self._last_tool_time = None
+        self._last_permission_tool = ""
+        self._last_permission_time = None
+        self._last_error = ""
 
     # ------------------------------------------------------------- threading --
     def start(self):
@@ -907,6 +963,96 @@ class ClaudeWorker(QObject):
     def busy(self):
         return self._busy
 
+    # --------------------------------------------------------------- progress --
+    def _status_touch(self, label: str) -> None:
+        now = time.monotonic()
+        with self._status_lock:
+            self._last_activity = now
+            self._last_activity_label = label
+
+    def _status_tool(self, name: str) -> None:
+        now = time.monotonic()
+        with self._status_lock:
+            self._last_activity = now
+            self._last_activity_label = f"执行工具 {name}"
+            self._tool_count += 1
+            self._last_tool = name
+            self._last_tool_time = now
+
+    def _status_permission(self, tool_name: str) -> None:
+        now = time.monotonic()
+        with self._status_lock:
+            self._last_permission_tool = tool_name
+            self._last_permission_time = now
+            self._last_activity_label = f"等待权限确认：{tool_name}"
+
+    def _status_permission_done(self, allowed: bool) -> None:
+        with self._status_lock:
+            self._last_permission_tool = ""
+            self._last_activity = time.monotonic()
+            self._last_activity_label = (
+                "权限已允许，继续执行" if allowed else "权限被拒绝")
+
+    def _status_reset_turn(self) -> None:
+        now = time.monotonic()
+        with self._status_lock:
+            self._turn_started = now
+            self._last_activity = now
+            self._last_activity_label = "请求已发送"
+            self._tool_count = 0
+            self._last_tool = ""
+            self._last_tool_time = None
+            self._last_permission_tool = ""
+            self._last_permission_time = None
+            self._last_error = ""
+
+    def _status_error(self, message: str) -> None:
+        with self._status_lock:
+            self._last_error = str(message or "")[:300]
+            self._last_activity = time.monotonic()
+            self._last_activity_label = "出错"
+
+    def status_snapshot(self) -> dict:
+        """线程安全的只读状态，供「进度查询」浮窗使用。"""
+        now = time.monotonic()
+        with self._status_lock:
+            busy = bool(self._busy)
+            mode = self._permission_mode or "default"
+            started = self._turn_started
+            last = self._last_activity
+            label = self._last_activity_label
+            tool_count = self._tool_count
+            last_tool = self._last_tool
+            last_tool_time = self._last_tool_time
+            perm_tool = self._last_permission_tool
+            perm_time = self._last_permission_time
+            last_error = self._last_error
+        with self._pending_lock:
+            pending = len(self._pending)
+            pending_tools = [
+                str(holder.get("tool") or "") for holder in self._pending.values()
+            ]
+        with self._dev_lock:
+            dev_mode = self._dev_mode or ""
+            dev_roots = len(self._dev_roots)
+        return {
+            "busy": busy,
+            "permission_mode": mode,
+            "elapsed": (now - started) if started else 0.0,
+            "since_activity": (now - last) if last else None,
+            "activity_label": label,
+            "tool_count": tool_count,
+            "last_tool": last_tool,
+            "last_tool_age": (now - last_tool_time) if last_tool_time else None,
+            "pending_permissions": pending,
+            "pending_tools": pending_tools,
+            "permission_tool": perm_tool,
+            "permission_age": (now - perm_time) if perm_time else None,
+            "dev_mode": dev_mode,
+            "dev_roots": dev_roots,
+            "last_error": last_error,
+        }
+
     def send(self, text):
         if self._busy:
             return False
@@ -920,6 +1066,13 @@ class ClaudeWorker(QObject):
             return False
         self._busy = True
         self.busy_changed.emit(True)
+        self._status_reset_turn()
+        if self._dev_mode:
+            # 新一轮请求开始：重新按“功能”授权，并清空本轮的改前快照
+            self._dev_turn_auto = False
+            self._dev_approved_files = set()
+            with self._dev_lock:
+                self._dev_pre_images = {}
         generation = self._generation
         future = self._submit(self._send_async(text, generation))
         if future is None:
@@ -941,9 +1094,16 @@ class ClaudeWorker(QObject):
                 self._handle(message)
         except Exception as exc:  # noqa: BLE001 - 错误显示在对话中
             if generation == self._generation:
+                self._status_error(f"{type(exc).__name__}: {exc}")
                 self.error.emit(f"{type(exc).__name__}: {exc}")
+                # 解析/连接失败后客户端通常已经不可用，丢弃它，下一轮重新连接，
+                # 否则用户修好问题再次提问还会命中同一个坏连接。
+                broken, self._client = self._client, None
+                if broken is not None:
+                    await self._disconnect(broken)
         finally:
             if generation == self._generation:
+                self._status_touch("本轮结束")
                 self._busy = False
                 self.busy_changed.emit(False)
 
@@ -969,6 +1129,8 @@ class ClaudeWorker(QObject):
             effort=self._effort or None,
             cli_path=executable,
             env=env,
+            # 截图/大文件工具结果会产生超过默认 1 MiB 的单条 JSON 消息
+            max_buffer_size=MAX_CLI_MESSAGE_BYTES,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
@@ -988,6 +1150,7 @@ class ClaudeWorker(QObject):
                 if delta.get("type") == "text_delta":
                     chunk = delta.get("text") or ""
                     if chunk:
+                        self._status_touch("正在输出回答")
                         self.text_delta.emit(chunk)
             return
 
@@ -1002,10 +1165,16 @@ class ClaudeWorker(QObject):
                 elif isinstance(block, ToolUseBlock):
                     tools.append({"name": block.name, "input": block.input})
             text = "\n".join(part for part in texts if part).strip()
+            if tools:
+                for tool in tools:
+                    self._status_tool(str(tool.get("name") or "工具"))
+            elif text:
+                self._status_touch("正在生成回答")
             self.assistant.emit(text, tools)
             return
 
         if isinstance(message, ResultMessage):
+            self._status_touch("已返回结果")
             self.result.emit({
                 "session_id": message.session_id,
                 "is_error": bool(message.is_error),
@@ -1016,22 +1185,132 @@ class ClaudeWorker(QObject):
             })
 
     # ------------------------------------------------------------- permission --
+    def set_dev_policy(self, roots, mode):
+        """开发页使用：设置允许修改的文件夹与修改模式。
+
+        开发模式一律用 SDK 的 default 权限模式启动，再由这里按用户选择的
+        三种模式自行放行/询问，这样才能在写入前抓到文件原始内容。
+        """
+        resolved = []
+        for root in roots or []:
+            try:
+                resolved.append(str(Path(root).expanduser().resolve()))
+            except OSError:
+                continue
+        with self._dev_lock:
+            self._dev_roots = resolved
+            self._dev_mode = mode or ""
+
+    def begin_dev_turn(self, deny_writes=False):
+        self._dev_turn_auto = False
+        self._dev_approved_files = set()
+        self._dev_deny_writes = bool(deny_writes)
+
+    def take_dev_pre_images(self):
+        """取走本轮写入前的文件内容快照。"""
+        with self._dev_lock:
+            data = dict(self._dev_pre_images)
+            self._dev_pre_images.clear()
+        return data
+
+    def _dev_target_path(self, input_data):
+        if not isinstance(input_data, dict):
+            return ""
+        raw = (input_data.get("file_path") or input_data.get("notebook_path")
+               or input_data.get("path") or "")
+        if not raw:
+            return ""
+        raw = str(raw)
+        if not raw.strip():
+            return ""
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            base = self._cwd or os.getcwd()
+            path = Path(base) / path
+        try:
+            return str(path.resolve())
+        except OSError:
+            return str(path.absolute())
+
+    def _dev_path_allowed(self, path):
+        if not path:
+            return False
+        root_list = list(self._dev_roots)
+        for root in root_list:
+            try:
+                if os.path.commonpath([path, root]) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _capture_dev_pre_image(self, tool_name, input_data):
+        path = self._dev_target_path(input_data)
+        if not path:
+            return
+        with self._dev_lock:
+            if path in self._dev_pre_images:
+                return
+            try:
+                text = Path(path).read_text(
+                    encoding="utf-8", errors="ignore")
+            except FileNotFoundError:
+                text = None  # 新建文件：取消时应删除
+            except OSError:
+                return
+            self._dev_pre_images[path] = text
+
+    def _dev_decision(self, tool_name, input_data):
+        """返回 (动作, 路径, 是否越界)。开发模式一律放行，不再弹权限窗。
+
+        是否覆盖代码由开发页的「修改模式」控制：自动覆盖 / 每轮确认 /
+        每次确认。只有代码检查请求会拒绝写入。
+        """
+        path = self._dev_target_path(input_data)
+        is_write = tool_name in DEV_WRITE_TOOLS
+        if self._dev_deny_writes and (is_write or tool_name == "Bash"):
+            return "deny", path, False
+        return "allow", path, False
+
     async def _can_use_tool(self, tool_name, input_data, _context):
-        if self._permission_mode == "bypassPermissions":
+        dev_active = bool(self._dev_roots) and self._dev_mode != ""
+        if dev_active:
+            action, path, outside = self._dev_decision(tool_name, input_data)
+            if action == "allow":
+                if tool_name in DEV_WRITE_TOOLS:
+                    self._capture_dev_pre_image(tool_name, input_data)
+                return PermissionResultAllow(updated_input=input_data)
+            if action == "deny":
+                return PermissionResultDeny(
+                    message="当前是代码检查请求，用户要求不要修改文件")
+        elif self._permission_mode == "bypassPermissions":
             return PermissionResultAllow(updated_input=input_data)
 
         self._perm_seq += 1
         request_id = self._perm_seq
-        holder = {"event": threading.Event(), "allowed": None}
+        holder = {"event": threading.Event(), "allowed": None,
+                  "tool": tool_name}
         with self._pending_lock:
             self._pending[request_id] = holder
         pretty = json.dumps(input_data, ensure_ascii=False, indent=2, default=str)
+        self._status_permission(tool_name)
+        if dev_active:
+            self.permission_detail.emit(request_id, path, bool(outside))
         self.permission_asked.emit(request_id, tool_name, pretty)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, holder["event"].wait)
         with self._pending_lock:
             self._pending.pop(request_id, None)
+        self._status_permission_done(bool(holder["allowed"]))
         if holder["allowed"]:
+            if dev_active:
+                if tool_name in DEV_WRITE_TOOLS:
+                    self._capture_dev_pre_image(tool_name, input_data)
+                if tool_name in DEV_WRITE_TOOLS and path:
+                    self._dev_approved_files.add(path)
+                if self._dev_mode == "function":
+                    # 这一轮已经询问过一次，后续 Bash 等命令不再重复询问
+                    self._dev_turn_auto = True
             return PermissionResultAllow(updated_input=input_data)
         return PermissionResultDeny(message="用户拒绝了这次操作")
 
@@ -1472,6 +1751,54 @@ class ChatBubble(QFrame):
 # 代码研读页：左侧 AI 解释 + 局部问答，右侧源码查看器
 # --------------------------------------------------------------------------- #
 STUDY_REF_RE = re.compile(r"\[\[code:\s*([^\[\]|]+?)\s*(?:\|\s*([^\]]*))?\]\]")
+
+# Qt 的 Markdown 解析器（md4c）会把正文里形如 <Vector3d> 的片段当成 HTML
+# 标签；一旦遇到无法闭合的标签，整篇文档从那里开始直接被丢弃。C++ 模板
+# 参数（vector<vector<Vector3d>>）和函数签名里非常常见，所以渲染前要把
+# 代码区之外的 '<' 转义成 &lt;（代码块/行内代码里的保持原样）。
+_MD_INLINE_CODE_RE = re.compile(r"(`+[^`\n]*?`+)")
+_MD_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _escape_markdown_angles(text):
+    """转义代码区之外的 '<'，避免 Qt Markdown 把模板参数当 HTML 标签。"""
+    if "<" not in text:
+        return text
+    lines = []
+    in_fence = False
+    for line in text.split("\n"):
+        if _MD_FENCE_RE.match(line):
+            in_fence = not in_fence
+            lines.append(line)
+            continue
+        if in_fence:
+            lines.append(line)
+            continue
+        parts = _MD_INLINE_CODE_RE.split(line)
+        for index in range(0, len(parts), 2):  # 偶数下标是代码区之外
+            parts[index] = parts[index].replace("<", "&lt;")
+        lines.append("".join(parts))
+    return "\n".join(lines)
+
+
+def _escape_link_label(label):
+    """链接文字里的方括号/反斜杠会把 Markdown 链接拆坏，需要转义。"""
+    return (label.replace("\\", "\\\\")
+            .replace("[", "\\[").replace("]", "\\]"))
+
+# 问答窗口只渲染最近若干条消息。历史太长时 Qt 的 Markdown 富文本渲染会
+# 明显变慢，内容过多还会错行/显示成方块，所以三个问答窗口都统一截断显示。
+QA_WINDOW_HISTORY = 10
+
+
+def visible_qa_messages(messages, limit=QA_WINDOW_HISTORY):
+    """取最近 limit 条消息；必要时把最前面那条回答配对的用户问题一起带上。"""
+    if len(messages) <= limit:
+        return messages
+    start = len(messages) - limit
+    if messages[start].get("role") != "user" and start > 0:
+        start -= 1
+    return messages[start:]
 # 行号分隔符可能被模型写成 ASCII 连字符、短横线、破折号或波浪号
 _STUDY_RANGE_SEP = r"[-–—~]"
 _STUDY_LINE_REF_RE = re.compile(
@@ -1525,10 +1852,12 @@ def study_refs_to_markdown(text):
             symbol = label
         fragment = f"#L{start}" + (f"-L{end}" if end != start else "")
         query = f"?sym={quote(symbol, safe='')}" if symbol else ""
+        label = _escape_link_label(label)
         return (f"[📄 {label}](code://{quote(path, safe='/._-')}"
                 f"{query}{fragment})")
 
-    return STUDY_REF_RE.sub(replace, text)
+    # 先替换引用再统一转义 '<'：链接文字里的模板参数（vector<...>）同样要转义。
+    return _escape_markdown_angles(STUDY_REF_RE.sub(replace, text))
 
 
 # --------------------------------------------------------------------------- #
@@ -2563,6 +2892,8 @@ class CodeStudyPage(QWidget):
         self._study_media = []  # [{"path","kind","caption"}]
         self._study_back_stack = []
         self._saved_study_name = ""
+        # 当前载入/保存的研读记录文件；之后的修改会自动同步回这个文件。
+        self._saved_study_path = None
         self._media_worker = None
         self._media_dialog = None
         self._media_busy = False
@@ -2583,6 +2914,11 @@ class CodeStudyPage(QWidget):
         self._qa_timer = QTimer(self)
         self._qa_timer.setInterval(80)
         self._qa_timer.timeout.connect(self._flush_qa_live)
+        # 载入记录后，内容变化稍后自动写回原记录文件。
+        self._record_timer = QTimer(self)
+        self._record_timer.setSingleShot(True)
+        self._record_timer.setInterval(900)
+        self._record_timer.timeout.connect(self._write_study_record)
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self):
@@ -2807,7 +3143,7 @@ class CodeStudyPage(QWidget):
         window = StudyQaWindow()
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
         head = QHBoxLayout()
@@ -2899,6 +3235,7 @@ class CodeStudyPage(QWidget):
         self._study_media = []
         self._render_media_results()
         self.goal_label.setText(self.HELP_TEXT)
+        self.goal_label.show()
         self._pending_quote = ""
         if hasattr(self, "qa_quote_hint"):
             self.qa_quote_hint.setText("未选中文字")
@@ -2925,7 +3262,8 @@ class CodeStudyPage(QWidget):
             del self._study_back_stack[:-15]
             self._update_study_buttons()
         self._study_goal = (goal or "").strip()
-        self.goal_label.setText(f"正在研读：{goal}")
+        # 研读进行中不显示「正在研读：…」这一行，节省顶部空间
+        self.goal_label.hide()
         self.explain_status.setText("Claude 正在生成解释…")
 
     def preview_explanation(self, text):
@@ -2948,6 +3286,7 @@ class CodeStudyPage(QWidget):
         self.append_explanation(f"> {text}")
 
     def _render_explanation(self, scroll="top"):
+        self._schedule_record_save()
         rendered = study_refs_to_markdown(self._explanation_markdown)
         self.explain_view.setMarkdown(rendered)
         bar = self.explain_view.verticalScrollBar()
@@ -3032,12 +3371,12 @@ class CodeStudyPage(QWidget):
             dict(item) for item in (state.get("study_media") or [])
             if item.get("path") and Path(item["path"]).exists()
         ]
-        if self._study_goal:
-            self.goal_label.setText(f"正在研读：{self._study_goal}")
-        elif self._saved_study_name:
-            self.goal_label.setText(f"研读记录：{self._saved_study_name}")
+        if self._study_goal or self._saved_study_name:
+            # 恢复已有研读内容时不再显示「正在研读 / 研读记录」这一行
+            self.goal_label.hide()
         else:
             self.goal_label.setText(self.HELP_TEXT)
+            self.goal_label.show()
         self._render_explanation(scroll="top")
         self._render_qa()
         self._render_media_results()
@@ -3059,6 +3398,9 @@ class CodeStudyPage(QWidget):
             return
         if push_current and self._has_study_content():
             self._study_back_stack.append(self._snapshot())
+        record_path = snapshot.get("_record_path")
+        if record_path:
+            self._saved_study_path = Path(record_path)
         self._saved_study_name = snapshot.get("name") or ""
         self._study_goal = snapshot.get("goal") or ""
         self._explanation_markdown = snapshot.get("explanation") or ""
@@ -3078,10 +3420,8 @@ class CodeStudyPage(QWidget):
             dict(item) for item in (snapshot.get("media") or [])
             if item.get("path") and Path(item["path"]).exists()
         ]
-        self.goal_label.setText(
-            f"研读记录：{self._study_goal or self._saved_study_name}"
-            if (self._study_goal or self._saved_study_name)
-            else "已载入研读记录")
+        # 载入记录后同样不显示「研读记录：…」这一行
+        self.goal_label.hide()
         self._render_explanation(scroll="top")
         self._render_qa()
         self._render_media_results()
@@ -3112,6 +3452,28 @@ class CodeStudyPage(QWidget):
                             "saved_at": saved_at, "root": root})
         return records
 
+    def _schedule_record_save(self):
+        """载入过研读记录时，内容改动后自动同步回原记录文件。"""
+        if self._saved_study_path is None:
+            return
+        timer = getattr(self, "_record_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _write_study_record(self):
+        path = self._saved_study_path
+        if path is None:
+            return
+        data = self._snapshot()
+        try:
+            Path(path).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except OSError as exc:
+            self.explain_status.setText(f"研读记录同步失败：{exc}")
+            return
+        self.explain_status.setText(f"研读记录已同步：{Path(path).name}")
+
     def _save_study(self):
         if not self._has_study_content():
             QMessageBox.information(
@@ -3138,6 +3500,7 @@ class CodeStudyPage(QWidget):
             QMessageBox.warning(self, "保存研读", f"保存失败：{exc}")
             return
         self._saved_study_name = name
+        self._saved_study_path = path
         self.explain_status.setText(f"研读已保存：{path.name}")
         self.status_note(f"研读已保存到 {path}")
 
@@ -3180,12 +3543,14 @@ class CodeStudyPage(QWidget):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "载入研读", f"无法读取记录：{exc}")
             return
+        data["_record_path"] = str(path)
         root = str(data.get("root") or "")
         if root and root != self.root:
             # 记录属于别的项目：交给主窗口切到那个项目自己的研读页再应用，
             # 不要污染当前项目（以及它可能已弹出的独立窗口）。
             self.load_record_requested.emit(data)
             return
+        self._saved_study_path = Path(path)
         self._apply_snapshot(data)
         self._update_study_buttons()
 
@@ -3216,8 +3581,14 @@ class CodeStudyPage(QWidget):
         self._pending_quote = ""
         self._study_goal = ""
         self._saved_study_name = ""
+        # 清空页面视为开始新的研读，不把已保存的记录覆盖成空内容。
+        self._saved_study_path = None
+        timer = getattr(self, "_record_timer", None)
+        if timer is not None:
+            timer.stop()
         self._study_media = []
         self.goal_label.setText(self.HELP_TEXT)
+        self.goal_label.show()
         self._render_media_results()
         self.qa_quote_hint.setText("未选中文字")
         self.explain_status.setText("等待研读请求")
@@ -3225,6 +3596,7 @@ class CodeStudyPage(QWidget):
 
     # ------------------------------------------------------------ media --
     def _render_media_results(self):
+        self._schedule_record_save()
         while self.study_media_layout.count():
             item = self.study_media_layout.takeAt(0)
             widget = item.widget()
@@ -3540,28 +3912,35 @@ class CodeStudyPage(QWidget):
 
     def _on_qa_assistant(self, text, _tools):
         self._qa_timer.stop()
-        answer = text or self._qa_live
+        segment = (text or "").strip()
+        # 一轮回答里可能有多个 AssistantMessage（工具调用前后各有一段），
+        # 流式累计的 _qa_live 才是整轮正文；只取 text 会丢掉前一段。
+        answer = self._qa_live
+        if segment and segment not in answer:
+            answer = f"{answer.rstrip()}\n\n{segment}" if answer else segment
         if not answer:
             return
         message = self._qa_message(self._qa_answer_id)
         if message is not None:
             message["text"] = answer
-            message["streaming"] = False
+            message["streaming"] = True
         self._last_answer = answer
-        self._qa_live = ""
         self._render_qa()
 
     def _on_qa_result(self, info):
         self._qa_timer.stop()
         message = self._qa_message(self._qa_answer_id)
-        if not self._last_answer and self._qa_live:
-            self._last_answer = self._qa_live
+        # 结果到达时以整轮累计正文为准，避免最后一段覆盖前面的内容。
+        answer = self._qa_live or self._last_answer
+        if answer:
+            self._last_answer = answer
             if message is not None:
-                message["text"] = self._last_answer
+                message["text"] = answer
                 message["streaming"] = False
             self._render_qa()
         elif message is not None:
             message["streaming"] = False
+        self._qa_live = ""
         self._qa_busy = False
         self._update_qa_buttons()
         if info.get("is_error") and not self._last_answer:
@@ -3636,11 +4015,12 @@ class CodeStudyPage(QWidget):
         self.qa_status.setText("已删除这条问答")
 
     def _render_qa(self):
+        self._schedule_record_save()
         if not self._qa_messages:
             self.qa_view.clear()
             return
         blocks = []
-        for message in self._qa_messages:
+        for message in visible_qa_messages(self._qa_messages):
             role = message.get("role")
             prefix = {"user": "**你**", "assistant": "**Claude**",
                       "error": "**出错**"}.get(role, "**Claude**")
@@ -4128,8 +4508,2571 @@ class CodeStudyPage(QWidget):
             self._worker.shutdown()
 
 
+# --------------------------------------------------------------------------- #
+# 代码开发页：多文件夹、三种修改模式、我的改动检查、改前/改后确认
+# --------------------------------------------------------------------------- #
+DEV_MODES = (
+    ("自动覆盖（不确认）", "all",
+     "AI 对代码的修改直接覆盖原文件，不弹确认窗口，也不弹权限窗口；"
+     "之后仍可用 ↶ 撤回"),
+    ("每轮确认一次", "function",
+     "每轮 AI 修改结束后统一确认一次，确认后覆盖本轮所有改动"),
+    ("每次都确认", "each",
+     "每个文件的修改都进入改前/改后预览，逐个确认后才覆盖"),
+)
+DEV_SOURCE_SUFFIXES = SOURCE_SUFFIXES | {
+    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".md",
+    ".markdown", ".toml", ".ini", ".cfg", ".conf", ".env", ".gradle",
+    ".cmake", ".txt", ".tex",
+}
+DEV_SKIP_DIRS = SourceTreeProxy.IGNORED_DIRS | {
+    "vendor", "third_party", "thirdparty", "external", "deps", "dist",
+    "out", "target", "obj", "bin", "site-packages", "Pods",
+    "bower_components", "packages", "coverage", "logs", "tmp",
+}
+DEV_CONFIG_PATH = CONFIG_DIR / "dev_state.json"
+DEV_SNAPSHOT_PATH = CONFIG_DIR / "dev_snapshot.json"
+
+
+def dev_scan_files(roots, max_files=4000, max_file_size=1_000_000,
+                   max_total=8_000_000):
+    """扫描允许修改的文件夹，返回 {绝对路径: 文本}（只收源码文件）。"""
+    files = {}
+    total = 0
+    for root in roots or []:
+        root_path = Path(root)
+        if not root_path.is_dir():
+            continue
+        try:
+            for dirpath, dirnames, filenames in os.walk(root_path):
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if d not in DEV_SKIP_DIRS and not d.startswith("."))
+                for name in sorted(filenames):
+                    if Path(name).suffix.lower() not in DEV_SOURCE_SUFFIXES:
+                        continue
+                    path = Path(dirpath) / name
+                    try:
+                        if path.stat().st_size > max_file_size:
+                            continue
+                        text = path.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    files[str(path)] = text
+                    total += len(text)
+                    if len(files) >= max_files or total >= max_total:
+                        return files
+        except OSError:
+            continue
+    return files
+
+
+def dev_line_changes(before, after):
+    """返回 (改前行号集合, 改后行号集合, opcodes)。"""
+    old_lines = (before or "").splitlines()
+    new_lines = (after or "").splitlines()
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    before_lines, after_lines = set(), set()
+    hunks = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        before_lines.update(range(i1 + 1, i2 + 1))
+        after_lines.update(range(j1 + 1, j2 + 1))
+        hunks.append((tag, i1, i2, j1, j2))
+    return before_lines, after_lines, hunks
+
+
+def dev_unified_diff(before, after, name="文件", limit=6000):
+    lines = list(difflib.unified_diff(
+        (before or "").splitlines(), (after or "").splitlines(),
+        fromfile=f"{name}（改前）", tofile=f"{name}（改后）", lineterm="", n=3))
+    text = "\n".join(lines)
+    if len(text) > limit:
+        text = text[:limit] + "\n…（diff 已截断）"
+    return text
+
+
+class DevCodeView(StudyCodeView):
+    """开发页代码视图：可编辑、按行高亮改动并在行号旁显示红色感叹号。"""
+
+    def __init__(self, editable=False, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(not editable)
+        self.change_lines = set()
+        self.change_color = "#332f9e63"
+        self._editable = editable
+
+    def _indent_unit(self):
+        return "\t" if "\t" in self._current_indent() else "    "
+
+    def _current_indent(self):
+        block = self.textCursor().block()
+        line = block.text()
+        indent = re.match(r"[ \t]*", line).group(0)
+        if indent or line.strip():
+            return indent
+        # 空行：沿用上一行的缩进，避免在代码块中间换行时突然顶格。
+        previous = block.previous()
+        if previous.isValid():
+            return re.match(r"[ \t]*", previous.text()).group(0)
+        return ""
+
+    def keyPressEvent(self, event):
+        """回车时延续当前行的缩进，并在 {([ 或 : 之后再多缩进一级。"""
+        if (self._editable
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and not self.textCursor().hasSelection()):
+            cursor = self.textCursor()
+            line = cursor.block().text()
+            before = line[:cursor.positionInBlock()]
+            indent = self._current_indent()
+            stripped = before.rstrip()
+            if stripped and stripped[-1] in "{([:":
+                indent += self._indent_unit()
+            super().keyPressEvent(event)
+            if indent:
+                self.textCursor().insertText(indent)
+            return
+        super().keyPressEvent(event)
+
+    def line_number_area_width(self):
+        return super().line_number_area_width() + 18
+
+    def set_change_lines(self, lines, color=None):
+        self.change_lines = {int(x) for x in (lines or [])}
+        if color:
+            self.change_color = color
+        self.line_number_area.update()
+        self._apply_change_highlights()
+
+    def _apply_change_highlights(self):
+        selections = []
+        for line in sorted(self.change_lines):
+            block = self.document().findBlockByNumber(line - 1)
+            if not block.isValid():
+                continue
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(block)
+            selection.format.setBackground(QColor(self.change_color))
+            selection.format.setProperty(QTextFormat.FullWidthSelection, True)
+            selections.append(selection)
+        self.setExtraSelections(selections)
+
+    def paint_line_numbers(self, event):
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor(CUTE_THEME["gutter_bg"]))
+        block = self.firstVisibleBlock()
+        number = block.blockNumber()
+        top = self.blockBoundingGeometry(block).translated(
+            self.contentOffset()).top()
+        bottom = top + self.blockBoundingRect(block).height()
+        height = self.fontMetrics().height()
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                line = number + 1
+                if line in self.change_lines:
+                    painter.setFont(self.font())
+                    painter.setPen(QColor("#d9457a"))
+                    painter.drawText(2, int(top), 16, height,
+                                     Qt.AlignLeft | Qt.AlignVCenter, "❗")
+                painter.setFont(self.font())
+                painter.setPen(QColor(CUTE_THEME["line_number"]))
+                painter.drawText(
+                    16, int(top), self.line_number_area.width() - 20,
+                    height, Qt.AlignRight | Qt.AlignVCenter, str(line))
+            block = block.next()
+            top = bottom
+            bottom = top + self.blockBoundingRect(block).height()
+            number += 1
+
+
+class DevDiffPanel(QWidget):
+    """内嵌在代码开发页里的改前/改后预览，不再另开窗口。
+
+    显示时右侧会暂时收起代码目录，把整块空间让给对比；
+    左侧对话仍然保留，可以继续提出修改要求。
+    """
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self.page = page
+        self._loading = False
+        self._refreshing = False
+        self._current_path = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        top = QHBoxLayout()
+        title = QLabel("AI 修改预览")
+        title.setObjectName("H2")
+        self.file_combo = QComboBox()
+        self.file_combo.setMinimumWidth(280)
+        self.file_combo.currentIndexChanged.connect(self._on_file_changed)
+        self.summary = QLabel("")
+        self.summary.setObjectName("Muted")
+        reload_btn = QPushButton("重新读取磁盘")
+        reload_btn.setObjectName("Flat")
+        reload_btn.setToolTip("丢弃右侧尚未确认的编辑，重新读取文件当前内容")
+        reload_btn.clicked.connect(self._reload_disk)
+        back_btn = QPushButton("返回代码")
+        back_btn.setObjectName("Flat")
+        back_btn.setToolTip("收起修改对比，回到代码目录和编辑器")
+        back_btn.clicked.connect(self.page._hide_diff_view)
+        top.addWidget(title)
+        top.addWidget(self.file_combo, 1)
+        top.addWidget(self.summary)
+        top.addWidget(reload_btn)
+        top.addWidget(back_btn)
+        layout.addLayout(top)
+
+        heads = QHBoxLayout()
+        self.before_head = QLabel("修改前")
+        self.before_head.setObjectName("H2")
+        self.after_head = QLabel("修改后（可直接编辑）")
+        self.after_head.setObjectName("H2")
+        heads.addWidget(self.before_head, 1)
+        heads.addWidget(self.after_head, 1)
+        layout.addLayout(heads)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(6)
+        self.before_view = DevCodeView(editable=False)
+        self.after_view = DevCodeView(editable=True)
+        self.before_view.set_change_lines([], "#33d9536f")
+        self.after_view.set_change_lines([], "#332f9e63")
+        splitter.addWidget(self.before_view)
+        splitter.addWidget(self.after_view)
+        splitter.setSizes([600, 600])
+        layout.addWidget(splitter, 1)
+
+        hint = QLabel(
+            "红色 ❗ 标出改动行。可以直接在右侧修改 AI 写的代码，"
+            "再点最下方「确认覆盖原代码」；也可以回到左侧对话继续提出修改要求。")
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        bottom = QHBoxLayout()
+        self.status = QLabel("")
+        self.status.setObjectName("Muted")
+        self.quote_btn = QPushButton("继续对话修改这段")
+        self.quote_btn.setObjectName("Flat")
+        self.quote_btn.setToolTip("把右侧选中的代码带入左侧对话，向 AI 提第二轮要求")
+        self.quote_btn.clicked.connect(self._quote_after_selection)
+        self.cancel_all_btn = QPushButton("全部取消")
+        self.cancel_all_btn.setObjectName("Danger")
+        self.cancel_all_btn.clicked.connect(self.page.cancel_all_changes)
+        self.confirm_all_btn = QPushButton("全部确认")
+        self.confirm_all_btn.setObjectName("Primary")
+        self.confirm_all_btn.clicked.connect(self.page.confirm_all_changes)
+        self.cancel_btn = QPushButton("取消并还原")
+        self.cancel_btn.setObjectName("Danger")
+        self.cancel_btn.clicked.connect(self.page.cancel_current_change)
+        self.confirm_btn = QPushButton("确认覆盖原代码")
+        self.confirm_btn.setObjectName("Primary")
+        self.confirm_btn.clicked.connect(self.page.confirm_current_change)
+        bottom.addWidget(self.status)
+        bottom.addWidget(self.quote_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(self.cancel_all_btn)
+        bottom.addWidget(self.confirm_all_btn)
+        bottom.addWidget(self.cancel_btn)
+        bottom.addWidget(self.confirm_btn)
+        layout.addLayout(bottom)
+
+    def refresh(self):
+        pending = self.page._pending
+        current = self.file_combo.currentData()
+        self._refreshing = True
+        self._loading = True
+        self.file_combo.clear()
+        for path in sorted(pending):
+            self.file_combo.addItem(self.page._display_path(path), path)
+        index = self.file_combo.findData(current)
+        if index < 0:
+            index = 0
+        if self.file_combo.count():
+            self.file_combo.setCurrentIndex(index)
+        self._loading = False
+        self._on_file_changed(self.file_combo.currentIndex())
+        self._refreshing = False
+
+    def _on_file_changed(self, _index):
+        if self._loading:
+            return
+        if not self._refreshing and self._current_path is not None:
+            entry = self.page._pending.get(self._current_path)
+            if entry is not None:
+                entry["after"] = self.after_view.toPlainText()
+        path = self.file_combo.currentData()
+        self._current_path = path
+        entry = self.page._pending.get(path)
+        if entry is None:
+            self.before_view.clear()
+            self.after_view.clear()
+            return
+        before = entry.get("original")
+        before_text = before if isinstance(before, str) else ""
+        after = entry.get("after", "")
+        self.before_view.setPlainText(before_text)
+        self.after_view.setPlainText(after)
+        before_lines, after_lines, hunks = dev_line_changes(before_text, after)
+        self.before_view.set_change_lines(before_lines, "#33d9536f")
+        self.after_view.set_change_lines(after_lines, "#332f9e63")
+        self.file_combo.setToolTip(path)
+        self.summary.setText(
+            f"{len(hunks)} 处改动 · 改前 {len(before_text.splitlines())} 行 / "
+            f"改后 {len(after.splitlines())} 行")
+        self.status.setText(path)
+        count = len(self.page._pending)
+        if self.page.mode == "function":
+            # 每轮确认一次：只保留「全部确认 / 全部取消」，一次覆盖本轮全部改动。
+            self.confirm_all_btn.setText("确认覆盖本轮全部")
+            self.cancel_all_btn.setText("取消本轮全部")
+            self.confirm_all_btn.setVisible(True)
+            self.cancel_all_btn.setVisible(True)
+            self.confirm_btn.setVisible(False)
+            self.cancel_btn.setVisible(False)
+        else:
+            multiple = count > 1
+            self.confirm_all_btn.setText("全部确认")
+            self.cancel_all_btn.setText("全部取消")
+            self.confirm_all_btn.setVisible(multiple)
+            self.cancel_all_btn.setVisible(multiple)
+            self.confirm_btn.setVisible(True)
+            self.cancel_btn.setVisible(True)
+        self.after_view.setFocus()
+
+    def store_editor(self):
+        path = self.file_combo.currentData()
+        entry = self.page._pending.get(path)
+        if entry is not None:
+            entry["after"] = self.after_view.toPlainText()
+
+    def _reload_disk(self):
+        path = self.file_combo.currentData()
+        entry = self.page._pending.get(path)
+        if entry is None:
+            return
+        try:
+            entry["after"] = Path(path).read_text(
+                encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            QMessageBox.warning(self, "重新读取", f"读取失败：{exc}")
+            return
+        self._on_file_changed(self.file_combo.currentIndex())
+
+    def current_path(self):
+        return self.file_combo.currentData()
+
+    def select_file(self, path):
+        """刷新后定位到指定文件（用于双击目录树里的待确认文件）。"""
+        self.refresh()
+        index = self.file_combo.findData(path)
+        if index >= 0:
+            self.file_combo.setCurrentIndex(index)
+
+    def _quote_after_selection(self):
+        cursor = self.after_view.textCursor()
+        text = cursor.selectedText().replace(" ", "\n") if cursor.hasSelection() else ""
+        entry_text = self.after_view.toPlainText()
+        if not text:
+            # 没选就引用所有改动行
+            lines = entry_text.splitlines()
+            changed = sorted(self.after_view.change_lines)
+            if changed:
+                text = "\n".join(lines[i - 1] for i in changed if 0 < i <= len(lines))
+            else:
+                text = entry_text
+        path = self.file_combo.currentData() or ""
+        self.page.quote_for_chat(path, text, pending=True)
+
+
+class DevQaWindow(QMainWindow):
+    """开发页悬浮问答窗：半透明、置顶，关闭后按键召回。"""
+
+    def __init__(self):
+        super().__init__(None, Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle("开发问答 · Claude 控制台")
+        self.setWindowIcon(make_app_icon())
+        self.setWindowOpacity(0.9)
+        self.resize(560, 660)
+
+
+class DevFloatWindow(QMainWindow):
+    """把代码开发页放进独立窗口；关闭时回到主窗口页签。"""
+
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Window)
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+
+class DevFolderDialog(QDialog):
+    """移除文件夹：打开已添加列表，多选后一次删除。"""
+
+    def __init__(self, roots, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("移除文件夹")
+        self.setWindowIcon(make_app_icon())
+        self.resize(600, 380)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        hint = QLabel("选择要移除的文件夹（可按住 Ctrl/Shift 多选）。"
+                      "只从允许修改列表中移除，不会删除磁盘上的文件。")
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for root in roots or []:
+            item = QListWidgetItem(f"📁 {Path(root).name}")
+            item.setData(Qt.UserRole, root)
+            item.setToolTip(root)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        layout.addWidget(self.list, 1)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("Flat")
+        cancel_btn.clicked.connect(self.reject)
+        remove_btn = QPushButton("移除所选")
+        remove_btn.setObjectName("Danger")
+        remove_btn.clicked.connect(self.accept)
+        bottom.addWidget(cancel_btn)
+        bottom.addWidget(remove_btn)
+        layout.addLayout(bottom)
+
+    def selected_roots(self):
+        return [item.data(Qt.UserRole) for item in self.list.selectedItems()]
+
+
+class CodeDevPage(QWidget):
+    """代码开发页：左侧对话，右侧文件与源码；AI 改动需确认后覆盖。"""
+
+    float_requested = pyqtSignal()
+    reveal_requested = pyqtSignal()
+
+    def __init__(self, config=None, parent=None):
+        super().__init__(parent)
+        self.config = config if isinstance(config, dict) else {}
+        # 允许修改的文件夹不跨进程恢复：每次重新打开程序都从空的文件夹列表开始，
+        # 只有主动「载入开发」才带回保存记录里的文件夹。
+        self.roots = []
+        saved_mode = self.config.get("dev_mode") or "function"
+        if saved_mode not in {m[1] for m in DEV_MODES}:
+            saved_mode = "function"
+        self.mode = saved_mode
+        self.model = None
+        self.effort = None
+        self._worker = None
+        self._worker_cfg = None
+        self._busy = False
+        self._messages = []  # [{"role","text"}]
+        self._live = ""
+        self._chat_dirty = False
+        self._pending = {}  # {path: {"original","after"}}
+        # 确认覆盖后的文件级撤回/前进记录：
+        # 每项为 [(path, before_text_or_None, after_text), ...]
+        self._file_undo = []
+        self._file_redo = []
+        self._snapshot = {}
+        self._snapshot_roots = []
+        self._turn_files = {}
+        self._current_file = None
+        self._perm_context = {}
+        self._tree_items = {}
+        self._diff_panel = None
+        self._qa_window = None
+        self._qa_view = None
+        self._qa_input = None
+        self._qa_send = None
+        self._qa_status = None
+        # 问答窗口使用自己的消息记录和后台会话，不与主 AI 对话同步。
+        self._qa_messages = []
+        self._qa_live = ""
+        self._qa_dirty = False
+        self._qa_busy = False
+        self._qa_worker = None
+        self._qa_worker_cfg = None
+        self._review_pending = False
+        self._floating = False
+        self._saved_dev_name = ""
+        # 当前载入/保存的开发记录文件；之后的修改会自动同步回这个文件。
+        self._saved_dev_path = None
+        # 右侧打开的文件页签：[{"path", "view"}]
+        self._code_tabs = []
+        self._placeholder_visible = True
+        self._build_ui()
+        self._load_state()
+        self._refresh_roots_list()
+        self._refresh_tree()
+        self._update_buttons()
+
+        self._chat_timer = QTimer(self)
+        self._chat_timer.setInterval(80)
+        self._chat_timer.timeout.connect(self._flush_chat)
+
+        self._qa_timer = QTimer(self)
+        self._qa_timer.setInterval(80)
+        self._qa_timer.timeout.connect(self._flush_qa_chat)
+
+        # 用户在当前文件里输入时，稍后刷新“我的改动”行标记
+        self._mark_timer = QTimer(self)
+        self._mark_timer.setSingleShot(True)
+        self._mark_timer.setInterval(400)
+        self._mark_timer.timeout.connect(self._refresh_viewer_marks)
+
+        # 代码编辑自动保存：停止输入约 0.7 秒后写回磁盘。
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(700)
+        self._autosave_timer.timeout.connect(self._autosave_current)
+
+        # 载入开发记录后，对话/改动等变化稍后自动写回原记录文件。
+        self._record_timer = QTimer(self)
+        self._record_timer.setSingleShot(True)
+        self._record_timer.setInterval(900)
+        self._record_timer.timeout.connect(self._write_dev_record)
+
+    # ------------------------------------------------------------------ UI --
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(8)
+
+        # 所有文件夹/记录/检查/查看/清空按键都收在同一行。
+        bar = QHBoxLayout()
+        bar.setSpacing(5)
+        mode_label = QLabel("修改模式")
+        mode_label.setObjectName("Muted")
+        bar.addWidget(mode_label)
+        self.mode_combo = QComboBox()
+        for label, value, tip in DEV_MODES:
+            self.mode_combo.addItem(label, value)
+            self.mode_combo.setItemData(
+                self.mode_combo.count() - 1, tip, Qt.ToolTipRole)
+        self.mode_combo.setCurrentIndex(
+            max(0, self.mode_combo.findData(self.mode)))
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        bar.addWidget(self.mode_combo)
+
+        # 文件夹相关的所有按键（以及记录/检查/查看/清空）都放在同一行。
+        self.add_folder_btn = QPushButton("＋ 添加")
+        self.add_folder_btn.setToolTip(
+            "添加允许修改的代码文件夹（可一次多选，之后还能继续添加）")
+        self.add_folder_btn.clicked.connect(self._add_folders)
+        self.remove_folder_btn = QPushButton("− 移除")
+        self.remove_folder_btn.setObjectName("Flat")
+        self.remove_folder_btn.setToolTip(
+            "打开已添加的文件夹列表，选中后一次移除（不会删除磁盘文件）")
+        self.remove_folder_btn.clicked.connect(self._remove_folder)
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setObjectName("Flat")
+        self.refresh_btn.setToolTip("刷新左侧代码目录")
+        self.refresh_btn.clicked.connect(self._refresh_tree)
+        self.mark_btn = QPushButton("标记节点")
+        self.mark_btn.setToolTip(
+            "把当前所有文件记录为「新代码起点」：之后自己改动的行会标 ❗，"
+            "「检查新代码」也只检查这个节点之后的改动。"
+            "系统不会自动挪动起点，需要时手动再点一次。")
+        self.mark_btn.clicked.connect(self._mark_new_code_start)
+        self.check_btn = QPushButton("检查新代码")
+        self.check_btn.setToolTip(
+            "只把「标记节点」之后你自己写的新代码发给 AI，"
+            "让它指出问题（只读，不会改文件）")
+        self.check_btn.clicked.connect(self._check_my_code)
+        self.clear_btn = QPushButton("清空")
+        self.clear_btn.setObjectName("Flat")
+        self.clear_btn.setToolTip("清空左侧 AI 对话")
+        self.clear_btn.clicked.connect(self._clear_chat)
+        bar.addWidget(self.add_folder_btn)
+        bar.addWidget(self.remove_folder_btn)
+        bar.addWidget(self.refresh_btn)
+        bar.addWidget(self.mark_btn)
+        bar.addWidget(self.check_btn)
+        bar.addWidget(self.clear_btn)
+        bar.addStretch(1)
+        self.save_dev_btn = QPushButton("保存开发")
+        self.save_dev_btn.setObjectName("Flat")
+        self.save_dev_btn.setToolTip(
+            "把当前开发对话、允许修改的文件夹和待确认改动保存成开发记录")
+        self.save_dev_btn.clicked.connect(self._save_dev)
+        self.load_dev_btn = QPushButton("载入开发")
+        self.load_dev_btn.setObjectName("Flat")
+        self.load_dev_btn.setToolTip("载入之前保存的开发记录")
+        self.load_dev_btn.clicked.connect(self._show_dev_menu)
+        bar.addWidget(self.save_dev_btn)
+        bar.addWidget(self.load_dev_btn)
+        self.float_btn = QPushButton("独立窗口")
+        self.float_btn.setObjectName("Flat")
+        self.float_btn.setToolTip("把代码开发页放进独立窗口；再次点击收回页签")
+        self.float_btn.clicked.connect(self.float_requested.emit)
+        bar.addWidget(self.float_btn)
+        layout.addLayout(bar)
+
+        # 操作反馈仍然显示，但挪到聊天标题右侧，不再单独占一行按键空间。
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("Muted")
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.status_label.setMinimumWidth(0)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(6)
+        splitter.setChildrenCollapsible(False)
+
+        # ---- 左：对话栏 ----
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.setSpacing(6)
+        chat_head = QHBoxLayout()
+        chat_title = QLabel("AI 对话")
+        chat_title.setObjectName("H2")
+        self.qa_open_btn = QPushButton("问答窗口")
+        self.qa_open_btn.setObjectName("Flat")
+        self.qa_open_btn.setToolTip("打开/召回悬浮问答窗口（Ctrl+Shift+E）")
+        self.qa_open_btn.clicked.connect(self._show_qa_window)
+        self.qa_select_btn = QPushButton("针对选中提问")
+        self.qa_select_btn.setObjectName("Flat")
+        self.qa_select_btn.setToolTip(
+            "先在右侧源码或对话里选中一段内容，再点这里，\n"
+            "把这段引用直接带入下方对话输入框（不弹独立窗口）")
+        self.qa_select_btn.clicked.connect(self._quote_for_qa)
+        self.chat_status = QLabel("等待指令")
+        self.chat_status.setObjectName("Muted")
+        chat_head.addWidget(chat_title)
+        chat_head.addWidget(self.qa_open_btn)
+        chat_head.addWidget(self.qa_select_btn)
+        chat_head.addStretch(1)
+        chat_head.addWidget(self.status_label)
+        chat_head.addWidget(self.chat_status)
+        left_layout.addLayout(chat_head)
+
+        self.chat_view = QTextBrowser()
+        self.chat_view.setOpenLinks(False)
+        self.chat_view.setOpenExternalLinks(False)
+        self.chat_view.setStyleSheet(
+            "QTextBrowser { background: #ffffff; border: 1px solid #f6d9e6;"
+            " border-radius: 8px; padding: 8px; color: #4b3742; }")
+        self.chat_view.setPlaceholderText(
+            "描述你想开发/修改的功能；也可以先在右侧选中一段代码，"
+            "点「对话改进这段」再提问")
+        left_layout.addWidget(self.chat_view, 1)
+
+        self.chat_input = ChatInput()
+        self.chat_input.setObjectName("ChatInput")
+        self.chat_input.setFixedHeight(96)
+        self.chat_input.setPlaceholderText(
+            "描述要开发或修改的功能，Enter 发送，Shift+Enter 换行")
+        self.chat_input.submitted.connect(self._send_chat)
+        left_layout.addWidget(self.chat_input)
+
+        bottom = QHBoxLayout()
+        self.quote_btn = QPushButton("对话改进这段")
+        self.quote_btn.setObjectName("Flat")
+        self.quote_btn.setToolTip(
+            "先在右侧源码（或在 AI 修改预览的「修改后」一栏）选中一段代码，"
+            "再点这里，把这段代码带入对话")
+        self.quote_btn.clicked.connect(self._quote_selection)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setObjectName("Danger")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._interrupt)
+        self.send_btn = QPushButton("发送")
+        self.send_btn.setObjectName("Primary")
+        self.send_btn.clicked.connect(self._send_chat)
+        bottom.addStretch(1)
+        bottom.addWidget(self.quote_btn)
+        bottom.addWidget(self.stop_btn)
+        bottom.addWidget(self.send_btn)
+        left_layout.addLayout(bottom)
+        splitter.addWidget(left)
+
+        # ---- 右：目录 + 源码 ----
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.setSpacing(6)
+        self.file_row_widget = QWidget()
+        file_row_layout = QVBoxLayout(self.file_row_widget)
+        file_row_layout.setContentsMargins(0, 0, 0, 0)
+        file_row_layout.setSpacing(0)
+        file_row = QHBoxLayout()
+        self.file_label = QLabel("尚未打开文件")
+        self.file_label.setObjectName("H2")
+        self.file_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.save_btn = QPushButton("保存")
+        self.save_btn.setObjectName("Flat")
+        self.save_btn.setToolTip("保存当前文件（Ctrl+S）")
+        self.save_btn.clicked.connect(self._save_current)
+        self.reload_file_btn = QPushButton("重新加载")
+        self.reload_file_btn.setObjectName("Flat")
+        self.reload_file_btn.clicked.connect(self._reload_current)
+        self.undo_btn = QPushButton("↶")
+        self.undo_btn.setObjectName("Flat")
+        self.undo_btn.setFixedWidth(34)
+        self.undo_btn.setToolTip("撤回上一次修改（Ctrl+Z）")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.clicked.connect(self._undo_current)
+        self.redo_btn = QPushButton("↷")
+        self.redo_btn.setObjectName("Flat")
+        self.redo_btn.setFixedWidth(34)
+        self.redo_btn.setToolTip("前进到下一次修改（Ctrl+Y / Ctrl+Shift+Z）")
+        self.redo_btn.setEnabled(False)
+        self.redo_btn.clicked.connect(self._redo_current)
+        self.vscode_btn = QPushButton("VS Code")
+        self.vscode_btn.setObjectName("Flat")
+        self.vscode_btn.clicked.connect(self._open_in_vscode)
+        file_row.addWidget(self.file_label, 1)
+        file_row.addWidget(self.save_btn)
+        file_row.addWidget(self.reload_file_btn)
+        file_row.addWidget(self.undo_btn)
+        file_row.addWidget(self.redo_btn)
+        file_row.addWidget(self.vscode_btn)
+        file_row_layout.addLayout(file_row)
+        right_layout.addWidget(self.file_row_widget)
+
+        # 普通代码视图 / 内嵌修改对比 共用右侧空间；对比时自动隐藏目录栏。
+        self.right_stack = QStackedWidget()
+        right_splitter = QSplitter(Qt.Horizontal)
+        right_splitter.setHandleWidth(5)
+        right_splitter.setChildrenCollapsible(False)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setMinimumWidth(170)
+        self.tree.itemDoubleClicked.connect(self._on_tree_activated)
+        self.tree.itemExpanded.connect(self._on_tree_expanded)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_context_menu)
+        self.tree.setStyleSheet(
+            "QTreeWidget { background: #fceaf1; border: 1px solid #f4b4cc;"
+            " border-radius: 6px; padding: 4px; color: #333333; }"
+            "QTreeWidget::item { padding: 2px 4px; }"
+            "QTreeWidget::item:hover { background: #fcdee9; }"
+            "QTreeWidget::item:selected { background: #ffb1b7; color: #39007f; }")
+        right_splitter.addWidget(self.tree)
+        # 打开的文件保留为页签，可切换、拖动或关闭（与代码研读一致）。
+        self.code_tabs = QTabWidget()
+        self.code_tabs.setObjectName("CodeTabs")
+        self.code_tabs.setTabsClosable(True)
+        self.code_tabs.setMovable(True)
+        self.code_tabs.setDocumentMode(True)
+        self.code_tabs.tabCloseRequested.connect(self._close_code_tab)
+        self.code_tabs.currentChanged.connect(self._on_code_tab_changed)
+        self.code_tabs.setStyleSheet(
+            "QTabWidget#CodeTabs::pane { border: 1px solid #f4b4cc;"
+            " background: #ffffff; }"
+            "QTabBar::tab { background: #fceaf1; color: #333333;"
+            " padding: 5px 12px; border: 1px solid #f4b4cc;"
+            " border-bottom: none; margin-right: 2px; }"
+            "QTabBar::tab:selected { background: #fcdee9; color: #39007f;"
+            " font-weight: 600; }"
+            "QTabBar::tab:hover { background: #fcdee9; }")
+        self.code_placeholder = QLabel(
+            "双击左侧目录里的文件打开\n打开的文件会保留为页签，可切换或关闭")
+        self.code_placeholder.setObjectName("Empty")
+        self.code_placeholder.setAlignment(Qt.AlignCenter)
+        self.code_placeholder.setWordWrap(True)
+        self.code_tabs.addTab(self.code_placeholder, "未打开文件")
+        self._placeholder_visible = True
+        right_splitter.addWidget(self.code_tabs)
+        right_splitter.setStretchFactor(0, 0)
+        right_splitter.setStretchFactor(1, 1)
+        right_splitter.setSizes([230, 700])
+        self.right_splitter = right_splitter
+        self.right_stack.addWidget(right_splitter)
+        self.diff_panel = DevDiffPanel(self)
+        self._diff_panel = self.diff_panel
+        self.right_stack.addWidget(self.diff_panel)
+        self.right_stack.setCurrentWidget(right_splitter)
+        right_layout.addWidget(self.right_stack, 1)
+        splitter.addWidget(right)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        # 左侧 AI 对话默认宽度为原来的 3/4（560 -> 420）。
+        splitter.setSizes([420, 780])
+        layout.addWidget(splitter, 1)
+
+        save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        save_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        save_shortcut.activated.connect(self._save_current)
+
+    # ------------------------------------------------------------- folders --
+    def _refresh_roots_list(self):
+        # 文件夹不再单独占一行显示；数量与待确认文件数只放在按钮提示里。
+        self.remove_folder_btn.setEnabled(bool(self.roots))
+        self.remove_folder_btn.setToolTip(
+            "打开已添加的文件夹列表，选中后一次移除（不会删除磁盘文件）"
+            if self.roots else "还没有添加文件夹")
+        self._update_buttons()
+
+    @staticmethod
+    def _is_under(path, root):
+        try:
+            return os.path.commonpath([str(path), str(root)]) == str(root)
+        except ValueError:
+            return False
+
+    def _add_folders(self):
+        dialog = QFileDialog(self, "选择代码文件夹（可按住 Ctrl/Shift 多选）")
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        for view_name in ("listView", "treeView"):
+            view = dialog.findChild(QListView if view_name == "listView"
+                                    else QTreeView, view_name)
+            if view is not None:
+                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        paths = []
+        list_view = dialog.findChild(QListView, "listView")
+        model = list_view.model() if list_view is not None else None
+        selection = (list_view.selectionModel()
+                     if list_view is not None else None)
+        if model is not None and selection is not None:
+            for index in selection.selectedIndexes():
+                if hasattr(model, "filePath"):
+                    paths.append(model.filePath(index))
+        if not paths:
+            paths.extend(dialog.selectedFiles())
+        added = 0
+        for path in paths:
+            if not path:
+                continue
+            try:
+                resolved = str(Path(path).expanduser().resolve())
+            except OSError:
+                continue
+            if not Path(resolved).is_dir() or resolved in self.roots:
+                continue
+            self.roots.append(resolved)
+            added += 1
+        if added:
+            self._persist()
+            self._refresh_roots_list()
+            self._refresh_tree()
+            if self._worker is not None:
+                self._worker.set_dev_policy(self.roots, self.mode)
+            self._schedule_dev_record_save()
+            self.status_label.setText(
+                f"已添加 {added} 个文件夹，可点「标记节点」记录新代码起点")
+
+    def _remove_folder(self):
+        if not self.roots:
+            self.status_label.setText("还没有添加文件夹")
+            return
+        dialog = DevFolderDialog(self.roots, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = set(dialog.selected_roots())
+        if not selected:
+            return
+        self.roots = [r for r in self.roots if r not in selected]
+        self._persist()
+        self._refresh_roots_list()
+        self._refresh_tree()
+        if self._worker is not None:
+            self._worker.set_dev_policy(self.roots, self.mode)
+        self._schedule_dev_record_save()
+        self.status_label.setText(f"已移除 {len(selected)} 个文件夹")
+
+    def _persist(self):
+        # 只记住修改模式；允许修改的文件夹不跨进程保存，重开程序时为空。
+        self.config["dev_mode"] = self.mode
+        try:
+            save_config(self.config)
+        except OSError:
+            pass
+
+    def _on_mode_changed(self, _index):
+        self.mode = self.mode_combo.currentData() or "function"
+        self._persist()
+        if self._worker is not None:
+            self._worker.set_dev_policy(self.roots, self.mode)
+        label = self.mode_combo.currentText()
+        self._schedule_dev_record_save()
+        self.status_label.setText(f"修改模式：{label}")
+
+    # ------------------------------------------------------- dev records --
+    def reset_for_new_chat(self):
+        """新对话/关闭对话时收起这次开发会话（不删除磁盘文件）。"""
+        if self._busy and self._worker is not None:
+            self._worker.interrupt()
+        if self._qa_busy and self._qa_worker is not None:
+            self._qa_worker.interrupt()
+        self._messages = []
+        self._live = ""
+        self._chat_dirty = False
+        self._qa_messages = []
+        self._qa_live = ""
+        self._qa_dirty = False
+        self._pending = {}
+        self._turn_files = {}
+        self._review_pending = False
+        self._saved_dev_name = ""
+        self._saved_dev_path = None
+        timer = getattr(self, "_record_timer", None)
+        if timer is not None:
+            timer.stop()
+        self.chat_input.clear()
+        if self._qa_input is not None:
+            self._qa_input.clear()
+        if self._qa_window is not None:
+            self._qa_window.close()
+        self._hide_diff_view()
+        self._refresh_tree_marks()
+        self._refresh_viewer_marks()
+        self._render_chat()
+        self._render_qa_chat()
+        self.chat_status.setText("等待指令")
+        self.status_label.setText("")
+        self._update_buttons()
+
+    def _dev_record_snapshot(self):
+        messages = [dict(m) for m in self._messages]
+        if self._live.strip():
+            messages.append({"role": "assistant", "text": self._live})
+        pending = {
+            path: {
+                "original": entry.get("original"),
+                "after": entry.get("after", ""),
+            }
+            for path, entry in self._pending.items()
+        }
+        return {
+            "format": 1,
+            "name": self._saved_dev_name or "未命名开发",
+            "roots": list(self.roots),
+            "mode": self.mode,
+            "messages": messages,
+            "current_file": self._current_file or "",
+            "pending": pending,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _dev_records(self):
+        records = []
+        if not DEV_RECORDS_DIR.is_dir():
+            return records
+        for path in sorted(DEV_RECORDS_DIR.glob("*.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True):
+            name = path.stem
+            saved_at = ""
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                name = data.get("name") or name
+                saved_at = str(data.get("saved_at") or "")
+            except (OSError, ValueError):
+                continue
+            records.append({"path": path, "name": name, "saved_at": saved_at})
+        return records
+
+    def _schedule_dev_record_save(self):
+        """载入过开发记录时，内容改动后自动同步回原记录文件。"""
+        if self._saved_dev_path is None:
+            return
+        timer = getattr(self, "_record_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _write_dev_record(self):
+        path = self._saved_dev_path
+        if path is None:
+            return
+        data = self._dev_record_snapshot()
+        try:
+            Path(path).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except OSError as exc:
+            self.status_label.setText(f"开发记录同步失败：{exc}")
+            return
+        self.status_label.setText(f"开发记录已同步：{Path(path).name}")
+
+    def _save_dev(self):
+        if not (self._messages or self._pending):
+            QMessageBox.information(
+                self, "保存开发", "当前还没有可保存的开发对话或修改。")
+            return
+        default_name = (self._saved_dev_name
+                        or f"开发 {datetime.now():%m-%d %H:%M}")
+        name, ok = QInputDialog.getText(
+            self, "保存开发", "开发记录名称：", text=default_name)
+        if not ok:
+            return
+        name = (name or default_name).strip() or default_name
+        safe = re.sub(r"[^\w一-鿿.-]+", "-", name).strip(".-") or "dev"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        DEV_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+        path = DEV_RECORDS_DIR / f"{stamp}-{safe[:60]}.json"
+        data = self._dev_record_snapshot()
+        data["name"] = name
+        try:
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "保存开发", f"保存失败：{exc}")
+            return
+        self._saved_dev_name = name
+        self._saved_dev_path = path
+        self.status_label.setText(f"开发已保存：{path.name}")
+        self.chat_status.setText(f"开发已保存：{name}")
+
+    def _show_dev_menu(self):
+        records = self._dev_records()
+        menu = QMenu(self)
+        act_save = menu.addAction("保存当前开发…")
+        menu.addSeparator()
+        actions = {}
+        if records:
+            for record in records[:20]:
+                label = record["name"]
+                if record["saved_at"]:
+                    label += f"  ·  {record['saved_at'][:16].replace('T', ' ')}"
+                action = menu.addAction(label)
+                actions[action] = record
+        else:
+            menu.addAction("（还没有保存的开发记录）").setEnabled(False)
+        menu.addSeparator()
+        act_open = menu.addAction("打开开发记录目录")
+        chosen = menu.exec_(
+            self.load_dev_btn.mapToGlobal(self.load_dev_btn.rect().bottomLeft()))
+        if chosen is None:
+            return
+        if chosen is act_save:
+            self._save_dev()
+        elif chosen is act_open:
+            DEV_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(["xdg-open", str(DEV_RECORDS_DIR)],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        elif chosen in actions:
+            self._load_dev_path(actions[chosen]["path"])
+
+    def _load_dev_path(self, path):
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "载入开发", f"无法读取记录：{exc}")
+            return
+        self._saved_dev_path = Path(path)
+        self._apply_dev_record(data)
+
+    def _apply_dev_record(self, data):
+        if not isinstance(data, dict):
+            return
+        if self._busy and self._worker is not None:
+            self._worker.interrupt()
+        roots = []
+        for root in data.get("roots") or []:
+            if not isinstance(root, str):
+                continue
+            try:
+                resolved = str(Path(root).expanduser().resolve())
+            except OSError:
+                continue
+            if Path(resolved).is_dir() and resolved not in roots:
+                roots.append(resolved)
+        mode = data.get("mode") or "function"
+        if mode not in {item[1] for item in DEV_MODES}:
+            mode = "function"
+        self.roots = roots
+        self.mode = mode
+        self.mode_combo.blockSignals(True)
+        index = self.mode_combo.findData(mode)
+        if index >= 0:
+            self.mode_combo.setCurrentIndex(index)
+        self.mode_combo.blockSignals(False)
+        self._messages = []
+        for item in data.get("messages") or []:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            role = "user" if item.get("role") == "user" else "assistant"
+            self._messages.append({"role": role, "text": text})
+        self._live = ""
+        self._chat_dirty = False
+        self._pending = {}
+        for path, entry in (data.get("pending") or {}).items():
+            if not isinstance(path, str) or not isinstance(entry, dict):
+                continue
+            after = entry.get("after")
+            if not isinstance(after, str):
+                continue
+            original = entry.get("original")
+            if not isinstance(original, str):
+                original = None
+            self._pending[path] = {"original": original, "after": after}
+        self._turn_files = {}
+        self._saved_dev_name = str(data.get("name") or "")
+        self._persist()
+        if self._worker is not None:
+            self._worker.set_dev_policy(self.roots, self.mode)
+        self._refresh_roots_list()
+        self._refresh_tree()
+        self._render_chat()
+        current = str(data.get("current_file") or "")
+        self._close_all_code_tabs()
+        if current and Path(current).is_file():
+            self._open_file(current)
+        self._refresh_viewer_marks()
+        if self._pending:
+            self._show_diff_view()
+        else:
+            self._hide_diff_view()
+        self.chat_status.setText("已载入开发记录")
+        self.status_label.setText(
+            f"开发记录：{self._saved_dev_name or '已载入'}"
+            "（可点「标记节点」记录新代码起点）")
+        self._update_buttons()
+
+    # ---------------------------------------------------------------- tree --
+    def _refresh_tree(self):
+        self.tree.clear()
+        self._tree_items = {}
+        for root in self.roots:
+            top = QTreeWidgetItem([Path(root).name])
+            top.setData(0, Qt.UserRole, ("dir", root))
+            top.setToolTip(0, root)
+            self.tree.addTopLevelItem(top)
+            placeholder = QTreeWidgetItem(["…"])
+            placeholder.setData(0, Qt.UserRole, ("placeholder", root))
+            top.addChild(placeholder)
+        self._refresh_tree_marks()
+
+    def _on_tree_expanded(self, item):
+        data = item.data(0, Qt.UserRole)
+        if not isinstance(data, tuple) or len(data) != 2:
+            return
+        kind, path = data
+        if kind != "dir":
+            return
+        self._load_tree_children(item, path)
+
+    def _load_tree_children(self, item, path):
+        if item.childCount() == 1:
+            only = item.child(0)
+            data = only.data(0, Qt.UserRole)
+            if isinstance(data, tuple) and data[0] == "placeholder":
+                item.removeChild(only)
+            else:
+                return
+        try:
+            entries = sorted(
+                Path(path).iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                if entry.name in DEV_SKIP_DIRS:
+                    continue
+                child = QTreeWidgetItem([entry.name])
+                child.setData(0, Qt.UserRole, ("dir", str(entry)))
+                child.setToolTip(0, str(entry))
+                placeholder = QTreeWidgetItem(["…"])
+                placeholder.setData(0, Qt.UserRole, ("placeholder", str(entry)))
+                child.addChild(placeholder)
+                item.addChild(child)
+            elif entry.suffix.lower() in DEV_SOURCE_SUFFIXES:
+                child = QTreeWidgetItem([entry.name])
+                child.setData(0, Qt.UserRole, ("file", str(entry)))
+                child.setToolTip(0, str(entry))
+                item.addChild(child)
+        self._refresh_tree_marks()
+
+    def _on_tree_activated(self, item, _column):
+        data = item.data(0, Qt.UserRole)
+        if not isinstance(data, tuple) or len(data) != 2:
+            return
+        kind, path = data
+        if kind == "file":
+            if path in self._pending:
+                # 「查看修改」按键已移除：双击带 ❗ 的文件直接打开对比。
+                self._show_diff_view()
+                if self._diff_panel is not None:
+                    self._diff_panel.select_file(path)
+            else:
+                self._open_file(path)
+        elif kind == "dir":
+            item.setExpanded(not item.isExpanded())
+
+    # ---------------------------------------------------- tree file actions --
+    def _tree_target(self, item):
+        """返回 (kind, path)；点空白处返回 (None, "")。"""
+        if item is None:
+            return None, ""
+        data = item.data(0, Qt.UserRole)
+        if isinstance(data, tuple) and len(data) == 2 \
+                and data[0] in ("file", "dir"):
+            return data[0], str(data[1])
+        return None, ""
+
+    def _tree_menu_dir(self, kind, path):
+        if kind == "dir":
+            return Path(path)
+        if kind == "file":
+            return Path(path).parent
+        if self.roots:
+            return Path(self.roots[0])
+        return None
+
+    def _is_root_path(self, path):
+        target = str(Path(path))
+        return any(target == str(Path(root)) for root in self.roots)
+
+    def _tree_context_menu(self, pos):
+        if not self.roots:
+            return
+        item = self.tree.itemAt(pos)
+        kind, path = self._tree_target(item)
+        directory = self._tree_menu_dir(kind, path)
+        menu = QMenu(self)
+        act_new_file = menu.addAction("新建文件")
+        act_new_folder = menu.addAction("新建文件夹")
+        act_rename = None
+        act_delete = None
+        if kind in ("file", "dir") and not self._is_root_path(path):
+            menu.addSeparator()
+            act_rename = menu.addAction("重命名")
+            act_delete = menu.addAction("删除")
+        menu.addSeparator()
+        act_refresh = menu.addAction("刷新")
+        chosen = menu.exec_(
+            self.tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_new_file:
+            self._tree_create_entry(directory, is_dir=False)
+        elif chosen is act_new_folder:
+            self._tree_create_entry(directory, is_dir=True)
+        elif act_rename is not None and chosen is act_rename:
+            self._tree_rename(path)
+        elif act_delete is not None and chosen is act_delete:
+            self._tree_delete(path)
+        elif chosen is act_refresh:
+            self._refresh_tree()
+
+    def _tree_create_entry(self, directory, is_dir):
+        if directory is None:
+            return
+        title = "新建文件夹" if is_dir else "新建文件"
+        name, ok = QInputDialog.getText(
+            self, title, "名称：", text="新建文件夹" if is_dir else "新建文件.txt")
+        if not ok or not (name or "").strip():
+            return
+        name = name.strip()
+        if "/" in name or "\\" in name:
+            QMessageBox.warning(self, title, "名称里不能包含路径分隔符。")
+            return
+        target = directory / name
+        try:
+            if is_dir:
+                target.mkdir(parents=False, exist_ok=False)
+            else:
+                target.touch(exist_ok=False)
+        except FileExistsError:
+            QMessageBox.warning(self, title, f"已存在：{name}")
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, title, f"创建失败：{exc}")
+            return
+        self._refresh_tree()
+        if not is_dir:
+            self._open_file(str(target))
+        self.status_label.setText(f"已创建：{self._display_path(str(target))}")
+
+    def _tree_rename(self, path):
+        old = Path(path)
+        name, ok = QInputDialog.getText(
+            self, "重命名", "新名称：", text=old.name)
+        if not ok or not (name or "").strip():
+            return
+        name = name.strip()
+        if "/" in name or "\\" in name:
+            QMessageBox.warning(self, "重命名", "名称里不能包含路径分隔符。")
+            return
+        target = old.with_name(name)
+        if target == old:
+            return
+        try:
+            old.rename(target)
+        except FileExistsError:
+            QMessageBox.warning(self, "重命名", f"已存在：{name}")
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, "重命名", f"重命名失败：{exc}")
+            return
+        # 已打开的页签跟着改名，避免之后保存到旧路径。
+        entry = self._entry_for_path(str(old))
+        if entry is not None:
+            entry["path"] = str(target)
+            index = self.code_tabs.indexOf(entry["view"])
+            if index >= 0:
+                self.code_tabs.setTabText(index, target.name)
+                self.code_tabs.setTabToolTip(index, str(target))
+            if self._current_file == str(old):
+                self._current_file = str(target)
+                self.file_label.setText(self._display_path(str(target)))
+                self.file_label.setToolTip(str(target))
+        self._refresh_tree()
+        self.status_label.setText(f"已重命名：{old.name} → {name}")
+
+    def _tree_delete(self, path):
+        target = Path(path)
+        answer = QMessageBox.question(
+            self, "删除",
+            f"确定删除「{target.name}」吗？\n"
+            + ("文件夹及其全部内容会被删除。" if target.is_dir()
+               else "该文件会被删除。")
+            + "\n此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except OSError as exc:
+            QMessageBox.warning(self, "删除", f"删除失败：{exc}")
+            return
+        # 关掉该路径（或目录下）的页签，并清掉对应的待确认改动。
+        for entry in list(self._code_tabs):
+            if self._is_under(str(entry["path"]), str(target)):
+                self._close_tab_for_path(str(entry["path"]))
+        for pending_path in list(self._pending):
+            if self._is_under(pending_path, str(target)):
+                self._pending.pop(pending_path, None)
+        self._refresh_tree()
+        self._refresh_viewer_marks()
+        self._update_buttons()
+        self.status_label.setText(f"已删除：{target.name}")
+
+    def _refresh_tree_marks(self):
+        pending = set(self._pending)
+        # 递归遍历（树通常不大）
+        def walk(item):
+            data = item.data(0, Qt.UserRole)
+            if isinstance(data, tuple) and len(data) == 2:
+                kind, target = data
+                if kind == "placeholder":
+                    return
+                name = Path(target).name
+                if kind == "file":
+                    marked = target in pending
+                elif kind == "dir":
+                    marked = any(self._is_under(path, target)
+                                 for path in pending)
+                else:
+                    marked = False
+                item.setText(0, ("❗ " if marked else "") + name)
+            for index in range(item.childCount()):
+                walk(item.child(index))
+        for index in range(self.tree.topLevelItemCount()):
+            walk(self.tree.topLevelItem(index))
+        self._refresh_roots_list()
+
+    # --------------------------------------------------------------- file --
+    def _display_path(self, path):
+        for root in self.roots:
+            if self._is_under(path, root):
+                try:
+                    return str(Path(path).relative_to(root))
+                except ValueError:
+                    pass
+        return str(path)
+
+    def _entry_for_path(self, path):
+        target = str(path)
+        return next((e for e in self._code_tabs
+                     if str(e["path"]) == target), None)
+
+    def _active_entry(self):
+        widget = self.code_tabs.currentWidget()
+        return next((e for e in self._code_tabs
+                     if e["view"] is widget), None)
+
+    def _active_view(self):
+        entry = self._active_entry()
+        return entry["view"] if entry is not None else None
+
+    def _open_file(self, path):
+        path = str(path)
+        entry = self._entry_for_path(path)
+        if entry is None:
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except OSError as exc:
+                QMessageBox.warning(self, "打开文件", f"读取失败：{exc}")
+                return
+            view = DevCodeView(editable=True)
+            view.set_change_lines([], "#33e4638c")
+            view.setPlainText(text)
+            view.document().setModified(False)
+            view.textChanged.connect(self._schedule_marks)
+            view.textChanged.connect(self._schedule_autosave)
+            view.undoAvailable.connect(
+                lambda v=view: self._update_undo_buttons(v))
+            view.redoAvailable.connect(
+                lambda v=view: self._update_undo_buttons(v))
+            entry = {"path": path, "view": view}
+            self._code_tabs.append(entry)
+            self._remove_code_placeholder()
+            index = self.code_tabs.addTab(view, Path(path).name)
+            self.code_tabs.setTabToolTip(index, path)
+        index = self.code_tabs.indexOf(entry["view"])
+        if index >= 0:
+            self.code_tabs.setCurrentIndex(index)
+        if self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+        entry["view"].document().setModified(False)
+        cursor = entry["view"].textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        entry["view"].setTextCursor(cursor)
+        self._current_file = path
+        self.file_label.setText(self._display_path(path))
+        self.file_label.setToolTip(path)
+        self._refresh_viewer_marks()
+        self.status_label.setText(f"已打开：{self._display_path(path)}")
+        self._schedule_dev_record_save()
+        self._update_undo_buttons()
+
+    def _on_code_tab_changed(self, _index):
+        entry = self._active_entry()
+        if entry is None:
+            self._current_file = None
+            self.file_label.setText("尚未打开文件")
+            self.file_label.setToolTip("")
+            self._update_undo_buttons()
+            return
+        self._current_file = str(entry["path"])
+        self.file_label.setText(self._display_path(entry["path"]))
+        self.file_label.setToolTip(str(entry["path"]))
+        self._refresh_viewer_marks()
+        self._schedule_dev_record_save()
+        self._update_undo_buttons()
+
+    def _close_code_tab(self, index):
+        widget = self.code_tabs.widget(index)
+        if widget is self.code_placeholder:
+            return
+        entry = next((e for e in self._code_tabs if e["view"] is widget), None)
+        if entry is not None:
+            self._code_tabs.remove(entry)
+        self.code_tabs.removeTab(index)
+        if widget is not None:
+            widget.deleteLater()
+        if not self._code_tabs:
+            self._current_file = None
+            self.file_label.setText("尚未打开文件")
+            self.file_label.setToolTip("")
+            self.code_tabs.addTab(self.code_placeholder, "未打开文件")
+            self._placeholder_visible = True
+            self._update_undo_buttons()
+        else:
+            self._on_code_tab_changed(self.code_tabs.currentIndex())
+
+    def _close_all_code_tabs(self):
+        self.code_tabs.blockSignals(True)
+        for entry in list(self._code_tabs):
+            index = self.code_tabs.indexOf(entry["view"])
+            if index >= 0:
+                self.code_tabs.removeTab(index)
+            entry["view"].deleteLater()
+        self._code_tabs = []
+        self.code_tabs.blockSignals(False)
+        self._remove_code_placeholder()
+        self._show_code_placeholder()
+        self._current_file = None
+        self.file_label.setText("尚未打开文件")
+        self.file_label.setToolTip("")
+        self._update_undo_buttons()
+
+    def _remove_code_placeholder(self):
+        index = self.code_tabs.indexOf(self.code_placeholder)
+        if index >= 0:
+            self.code_tabs.removeTab(index)
+        self._placeholder_visible = False
+
+    def _show_code_placeholder(self):
+        if self.code_tabs.indexOf(self.code_placeholder) < 0:
+            self.code_tabs.addTab(self.code_placeholder, "未打开文件")
+        self._placeholder_visible = True
+        self.code_tabs.setCurrentWidget(self.code_placeholder)
+
+    def _schedule_marks(self, *_args):
+        self._mark_timer.start()
+
+    def _refresh_viewer_marks(self):
+        for entry in self._code_tabs:
+            path = str(entry["path"])
+            view = entry["view"]
+            pending = self._pending.get(path)
+            if pending is not None:
+                _before, lines, _hunks = dev_line_changes(
+                    pending.get("original", ""), pending.get("after", ""))
+                view.set_change_lines(lines, "#332f9e63")
+                color_pending = True
+            else:
+                old = self._snapshot.get(path)
+                current = view.toPlainText()
+                if not self._snapshot:
+                    # 还没有“我的起点”，不把所有行都标成改动
+                    lines = set()
+                elif old is None:
+                    lines = (set(range(1, len(current.splitlines()) + 1))
+                             if current else set())
+                elif old != current:
+                    _before, lines, _hunks = dev_line_changes(old, current)
+                else:
+                    lines = set()
+                view.set_change_lines(lines, "#33e4638c")
+                color_pending = False
+            index = self.code_tabs.indexOf(view)
+            if index >= 0:
+                name = Path(path).name
+                self.code_tabs.setTabText(
+                    index, ("❗ " if color_pending else "") + name)
+
+    def _save_current(self, quiet=False, view=None):
+        entry = self._active_entry()
+        if view is not None:
+            entry = next((e for e in self._code_tabs
+                          if e["view"] is view), None)
+        if entry is None:
+            return False
+        path = entry["path"]
+        text = entry["view"].toPlainText()
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            if not quiet:
+                QMessageBox.warning(self, "保存文件", f"保存失败：{exc}")
+            self.status_label.setText(f"保存失败：{exc}")
+            return False
+        entry["view"].document().setModified(False)
+        if not quiet:
+            self.status_label.setText(f"已保存：{self._display_path(path)}")
+        self._refresh_viewer_marks()
+        self._refresh_tree_marks()
+        return True
+
+    def _schedule_autosave(self, *_args):
+        # 载入文件时 setPlainText 也会触发 textChanged，此时文档未被修改。
+        if any(e["view"].document().isModified() for e in self._code_tabs):
+            self._autosave_timer.start()
+
+    def _autosave_current(self):
+        saved = []
+        for entry in list(self._code_tabs):
+            if not entry["view"].document().isModified():
+                continue
+            if self._save_current(quiet=True, view=entry["view"]):
+                saved.append(self._display_path(entry["path"]))
+        if saved:
+            self.status_label.setText(f"已自动保存：{'、'.join(saved)}")
+
+    def _update_undo_buttons(self, view=None):
+        if view is not None and view is not self._active_view():
+            return
+        entry = self._active_entry()
+        doc = entry["view"].document() if entry is not None else None
+        self.undo_btn.setEnabled(
+            (doc is not None and doc.isUndoAvailable())
+            or bool(self._file_undo))
+        self.redo_btn.setEnabled(
+            (doc is not None and doc.isRedoAvailable())
+            or bool(self._file_redo))
+
+    def _undo_current(self):
+        # 先在编辑器内撤回手动输入；编辑器没有可撤回内容时，
+        # 再撤回「确认覆盖原代码」造成的文件写入。
+        entry = self._active_entry()
+        doc = entry["view"].document() if entry is not None else None
+        if doc is not None and doc.isUndoAvailable():
+            entry["view"].undo()
+            self._schedule_autosave()
+        else:
+            self._undo_confirmed_change()
+        self._update_undo_buttons()
+
+    def _redo_current(self):
+        entry = self._active_entry()
+        doc = entry["view"].document() if entry is not None else None
+        if doc is not None and doc.isRedoAvailable():
+            entry["view"].redo()
+            self._schedule_autosave()
+        else:
+            self._redo_confirmed_change()
+        self._update_undo_buttons()
+
+    # ---------------------------------------------- confirmed-change undo --
+    @staticmethod
+    def _write_history_text(path, text):
+        if text is None:
+            Path(path).unlink(missing_ok=True)
+        else:
+            Path(path).write_text(text, encoding="utf-8")
+
+    def _push_file_history(self, changes):
+        changes = [item for item in changes if item[1] != item[2]]
+        if not changes:
+            return
+        self._file_undo.append(changes)
+        del self._file_undo[:-50]
+        self._file_redo.clear()
+        self._update_undo_buttons()
+
+    def _undo_confirmed_change(self):
+        if not self._file_undo:
+            return False
+        changes = self._file_undo.pop()
+        done = []
+        for path, before, after in changes:
+            try:
+                self._write_history_text(path, before)
+            except OSError as exc:
+                QMessageBox.warning(self, "撤回修改", f"{path}\n{exc}")
+                continue
+            done.append((path, before, after))
+        if not done:
+            self._file_undo.append(changes)
+            self._update_undo_buttons()
+            return False
+        self._file_redo.append(done)
+        self._refresh_after_file_history("已撤回确认覆盖")
+        return True
+
+    def _redo_confirmed_change(self):
+        if not self._file_redo:
+            return False
+        changes = self._file_redo.pop()
+        done = []
+        for path, before, after in changes:
+            try:
+                self._write_history_text(path, after)
+            except OSError as exc:
+                QMessageBox.warning(self, "前进修改", f"{path}\n{exc}")
+                continue
+            done.append((path, before, after))
+        if not done:
+            self._file_redo.append(changes)
+            self._update_undo_buttons()
+            return False
+        self._file_undo.append(done)
+        self._refresh_after_file_history("已前进到确认覆盖后的版本")
+        return True
+
+    def _refresh_after_file_history(self, message):
+        self._refresh_tree_marks()
+        if self._current_file and Path(self._current_file).exists():
+            self._reload_file_tab(self._current_file)
+        elif self._current_file:
+            self._close_tab_for_path(self._current_file)
+        self._schedule_dev_record_save()
+        self.status_label.setText(message)
+        self._update_buttons()
+        self._update_undo_buttons()
+
+    def _close_tab_for_path(self, path):
+        entry = self._entry_for_path(path)
+        if entry is None:
+            return
+        index = self.code_tabs.indexOf(entry["view"])
+        if index >= 0:
+            self._close_code_tab(index)
+
+    def _reload_file_tab(self, path):
+        """重新读取磁盘内容，覆盖该文件页签里尚未保存的编辑。"""
+        entry = self._entry_for_path(path)
+        if entry is None:
+            self._open_file(path)
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            QMessageBox.warning(self, "重新加载", f"读取失败：{exc}")
+            return
+        if self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+        entry["view"].setPlainText(text)
+        entry["view"].document().setModified(False)
+        cursor = entry["view"].textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        entry["view"].setTextCursor(cursor)
+        if self._active_entry() is entry:
+            self._current_file = str(entry["path"])
+            self.file_label.setText(self._display_path(entry["path"]))
+            self.file_label.setToolTip(str(entry["path"]))
+        self._refresh_viewer_marks()
+        self._update_undo_buttons()
+        self.status_label.setText(f"已重新加载：{self._display_path(path)}")
+
+    def _reload_current(self):
+        if self._current_file:
+            self._reload_file_tab(self._current_file)
+
+    def _open_in_vscode(self):
+        if self._current_file and shutil.which("code"):
+            subprocess.Popen(["code", self._current_file],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+
+    # --------------------------------------------------------------- chat --
+    def _markdown(self):
+        parts = []
+        for message in self._messages:
+            who = "🟣 你" if message.get("role") == "user" else "🤖 Claude"
+            parts.append(f"### {who}\n\n{message.get('text', '')}")
+        if self._live:
+            parts.append(f"### 🤖 Claude\n\n{self._live}")
+        return "\n\n---\n\n".join(parts) if parts else ""
+
+    def _render_chat(self):
+        text = _escape_markdown_angles(self._markdown())
+        self.chat_view.setMarkdown(text)
+        bar = self.chat_view.verticalScrollBar()
+        QTimer.singleShot(0, lambda b=bar: b.setValue(b.maximum()))
+
+    def _flush_chat(self):
+        if not self._chat_dirty:
+            self._chat_timer.stop()
+            return
+        self._chat_dirty = False
+        self._render_chat()
+
+    def _qa_markdown(self):
+        parts = []
+        for message in visible_qa_messages(self._qa_messages):
+            who = "🟣 你" if message.get("role") == "user" else "🤖 Claude"
+            parts.append(f"### {who}\n\n{message.get('text', '')}")
+        if self._qa_live:
+            parts.append(f"### 🤖 Claude\n\n{self._qa_live}")
+        return _escape_markdown_angles(
+            "\n\n---\n\n".join(parts)) if parts else ""
+
+    def _render_qa_chat(self):
+        if self._qa_view is None:
+            return
+        self._qa_view.setMarkdown(self._qa_markdown())
+        bar = self._qa_view.verticalScrollBar()
+        QTimer.singleShot(0, lambda b=bar: b.setValue(b.maximum()))
+
+    def _flush_qa_chat(self):
+        if not self._qa_dirty:
+            self._qa_timer.stop()
+            return
+        self._qa_dirty = False
+        self._render_qa_chat()
+
+    def _append_qa_message(self, role, text):
+        if not (text or "").strip():
+            return
+        self._qa_messages.append({"role": role, "text": text.strip()})
+        # 开发问答没有落盘需求，内存里也只保留窗口可见的最近若干条。
+        self._qa_messages[:] = list(visible_qa_messages(self._qa_messages))
+        self._qa_dirty = True
+        if not self._qa_timer.isActive():
+            self._qa_timer.start()
+
+    def _append_message(self, role, text):
+        if not (text or "").strip():
+            return
+        self._messages.append({"role": role, "text": text.strip()})
+        if len(self._messages) > 200:
+            del self._messages[:50]
+        self._schedule_dev_record_save()
+        self._chat_dirty = True
+        if not self._chat_timer.isActive():
+            self._chat_timer.start()
+
+    def _clear_chat(self):
+        self._messages = []
+        self._live = ""
+        self._schedule_dev_record_save()
+        self._render_chat()
+        self.chat_status.setText("对话已清空")
+
+    def _ensure_worker(self):
+        if self._worker is None:
+            worker = ClaudeWorker(self)
+            worker.text_delta.connect(self._on_delta)
+            worker.assistant.connect(self._on_assistant)
+            worker.result.connect(self._on_result)
+            worker.error.connect(self._on_error)
+            worker.busy_changed.connect(self._on_busy)
+            worker.permission_detail.connect(self._on_permission_detail)
+            worker.permission_asked.connect(self._on_permission_asked)
+            self._worker = worker
+            worker.start()
+        self._worker.set_dev_policy(self.roots, self.mode)
+        root = self.roots[0] if self.roots else ""
+        cfg = (root, self.model, self.effort)
+        if self._worker_cfg != cfg:
+            self._worker.configure(
+                root, "default", model=self.model, effort=self.effort)
+            self._worker_cfg = cfg
+            self._worker.set_dev_policy(self.roots, self.mode)
+
+    def set_runtime(self, model=None, effort=None, permission=None):
+        if model != self.model or effort != self.effort:
+            self.model = model
+            self.effort = effort
+            if self._worker is not None:
+                self._worker_cfg = None
+            if self._qa_worker is not None:
+                self._qa_worker_cfg = None
+
+    def set_floating(self, floating):
+        """更新独立窗口按钮的外观（页面搬到独立窗口后变成「收回页签」）。"""
+        self._floating = bool(floating)
+        self.float_btn.setText("收回页签" if self._floating else "独立窗口")
+        self.float_btn.setToolTip(
+            "把代码开发页收回主窗口页签" if self._floating
+            else "把代码开发页放进独立窗口；再次点击收回页签")
+
+    def _update_buttons(self):
+        ready = bool(self.roots) and SDK_AVAILABLE
+        self.send_btn.setEnabled(ready and not self._busy)
+        self.stop_btn.setEnabled(self._busy)
+        self.mark_btn.setEnabled(ready and not self._busy)
+        self.check_btn.setEnabled(ready and not self._busy)
+        self._update_undo_buttons()
+        if self._qa_send is not None:
+            self._qa_send.setEnabled(ready and not self._qa_busy)
+
+    def _chat_context(self):
+        lines = ["【代码开发模式】", "允许直接修改的文件夹："]
+        lines.extend(f"- {root}" for root in self.roots)
+        if self.mode == "all":
+            how = "修改会直接覆盖原文件，不会弹确认窗口。"
+        elif self.mode == "function":
+            how = "每轮修改结束后会统一确认一次再覆盖。"
+        else:
+            how = "每个文件的修改都要逐个确认后才覆盖。"
+        lines.append(
+            f"修改处理方式：{self.mode_combo.currentText()}。{how}"
+            "不会再单独请求权限。")
+        if self._current_file:
+            lines.append(f"当前打开文件：{self._current_file}")
+        lines.append(
+            "请直接使用读写/编辑工具完成修改；只需说明改了什么以及为什么。")
+        return "\n".join(lines)
+
+    def _start_send(self, prompt, display, deny_writes=False):
+        if self._busy:
+            return False
+        if not self.roots:
+            QMessageBox.information(
+                self, "代码开发", "请先添加至少一个允许修改的代码文件夹。")
+            return False
+        if not SDK_AVAILABLE:
+            QMessageBox.warning(
+                self, "缺少对话组件",
+                f"未安装 Claude Agent SDK，无法在界面内开发。\n\n{SDK_IMPORT_ERROR}")
+            return False
+        self._ensure_worker()
+        # 本轮开始前的文件内容：Edit/Write 由工作线程精确抓取；
+        # 这里再兜底一次，Bash 等方式造成的改动也能进入改前/改后预览。
+        self._turn_files = dev_scan_files(self.roots)
+        self._worker.begin_dev_turn(deny_writes=deny_writes)
+        self._review_pending = bool(deny_writes)
+        self._append_message("user", display)
+        self._live = ""
+        self._busy = True
+        self.chat_status.setText("Claude 正在处理…")
+        self._update_buttons()
+        if not self._worker.send(prompt):
+            self._busy = False
+            self.chat_status.setText("发送失败")
+            self._update_buttons()
+            return False
+        return True
+
+    def _send_chat(self):
+        text = self.chat_input.toPlainText().strip()
+        if not text:
+            return
+        prompt = self._chat_context() + "\n\n用户要求：\n" + text
+        if self._start_send(prompt, text):
+            self.chat_input.clear()
+
+    def _quote_selection(self):
+        # 正在看 AI 修改预览时，引用「修改后」一栏里尚未确认的新代码；
+        # 否则引用当前打开的源码文件。
+        in_diff = (self._diff_panel is not None
+                   and self.right_stack.currentWidget() is self._diff_panel)
+        if in_diff:
+            view = self.diff_panel.after_view
+            path = self.diff_panel.current_path() or ""
+        else:
+            view = self._active_view()
+            path = self._current_file or ""
+        if view is None:
+            self.status_label.setText("请先在右侧打开一个代码文件")
+            return
+        cursor = view.textCursor()
+        if not cursor.hasSelection():
+            self.status_label.setText(
+                "请先在右侧「修改后」一栏选中一段新代码"
+                if in_diff else "请先在右侧源码里选中一段代码")
+            return
+        start = view.document().findBlock(
+            cursor.selectionStart()).blockNumber() + 1
+        last_pos = max(cursor.selectionStart(), cursor.selectionEnd() - 1)
+        end = view.document().findBlock(last_pos).blockNumber() + 1
+        selected = cursor.selectedText().replace(" ", "\n")
+        self.quote_for_chat(path, selected, start, end, pending=in_diff)
+
+    def _quote_for_qa(self):
+        """把源码或对话里的选中内容带入悬浮问答窗。"""
+        text = ""
+        where = "选中内容"
+        suffix = ""
+        active_view = self._active_view()
+        cursor = active_view.textCursor() if active_view is not None else None
+        if cursor is not None and cursor.hasSelection():
+            selected = cursor.selectedText().replace(" ", "\n").strip()
+            if selected:
+                start = active_view.document().findBlock(
+                    cursor.selectionStart()).blockNumber() + 1
+                last_pos = max(cursor.selectionStart(), cursor.selectionEnd() - 1)
+                end = active_view.document().findBlock(last_pos).blockNumber() + 1
+                name = (self._display_path(self._current_file)
+                        if self._current_file else "当前文件")
+                where = f"{name}:{start}-{end}"
+                suffix = Path(self._current_file or "").suffix.lstrip(".")
+                text = selected
+        if not text:
+            cursor = self.chat_view.textCursor()
+            if cursor.hasSelection():
+                text = cursor.selectedText().replace(" ", "\n").strip()
+                where = "对话内容"
+        if not text:
+            self.status_label.setText("请先在右侧源码或对话里选中一段内容")
+            return
+        # 不再弹出独立问答窗：直接把引用带入下方对话输入框。
+        block = f"```{suffix}\n{text}\n```"
+        if len(block) > 8000:
+            block = block[:8000] + "\n…（引用已截断）\n```"
+        header = f"关于这段内容（{where}）：\n{block}\n\n我的问题："
+        self.chat_input.setPlainText(header)
+        cursor = self.chat_input.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.chat_input.setTextCursor(cursor)
+        self.chat_input.setFocus()
+        self.status_label.setText("已把选中内容带入下方对话，输入问题后发送")
+
+    def quote_for_chat(self, path, text, start=None, end=None, pending=False):
+        name = self._display_path(path) if path else "当前文件"
+        where = f"{name}:{start}-{end}" if start else name
+        if pending:
+            where += "（AI 修改后，尚未覆盖）"
+        suffix = Path(path).suffix.lstrip(".") if path else ""
+        block = f"```{suffix}\n{text.strip()}\n```"
+        if len(block) > 8000:
+            block = block[:8000] + "\n…（引用已截断）\n```"
+        header = f"关于这段代码（{where}）：\n{block}\n\n我希望："
+        self.chat_input.setPlainText(header)
+        cursor = self.chat_input.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.chat_input.setTextCursor(cursor)
+        self.chat_input.setFocus()
+        self.show()
+        self.raise_()
+
+    def _interrupt(self):
+        if self._worker is not None and self._busy:
+            self._worker.interrupt()
+            self.chat_status.setText("正在停止…")
+
+    # ------------------------------------------------------------- worker --
+    def _on_delta(self, chunk):
+        self._live += chunk
+        self._chat_dirty = True
+        if not self._chat_timer.isActive():
+            self._chat_timer.start()
+
+    def _on_assistant(self, text, _tools):
+        if (text or "").strip():
+            self._live = ""
+            self._append_message("assistant", text)
+
+    def _on_busy(self, busy):
+        self._busy = bool(busy)
+        if busy:
+            self.chat_status.setText("Claude 正在处理…")
+        else:
+            self.chat_status.setText("就绪")
+        self._update_buttons()
+
+    def _on_error(self, message):
+        self._live = ""
+        self._append_message("assistant", f"⚠️ {message}")
+        self.chat_status.setText("出错")
+
+    def _on_result(self, _info):
+        self._live = ""
+        self._merge_ai_changes()
+        self._busy = False
+        self.chat_status.setText("就绪")
+        self._schedule_dev_record_save()
+        self._render_chat()
+        self._update_buttons()
+
+    def _on_permission_detail(self, request_id, path, outside):
+        self._perm_context[request_id] = (path, outside)
+
+    def _on_permission_asked(self, request_id, tool_name, input_text):
+        _path, outside = self._perm_context.pop(request_id, ("", False))
+        note = ""
+        if outside:
+            note = ("⚠️ 该文件不在你允许修改的文件夹内。"
+                    "按照设置，文件夹外的修改必须逐次申请。")
+        if self._worker is None:
+            return
+        dialog = PermissionDialog(tool_name, input_text, self, note=note)
+        allowed = dialog.exec_() == QDialog.Accepted
+        self._worker.respond_permission(request_id, allowed)
+        self.status_label.setText("已允许本次操作" if allowed else "已拒绝本次操作")
+
+    # ------------------------------------------------------ AI change flow --
+    def _merge_ai_changes(self):
+        if self._worker is None:
+            return
+        pre_images = self._worker.take_dev_pre_images()
+        current = dev_scan_files(self.roots)
+        turn_files = self._turn_files or {}
+        changed = False
+        removed = False
+        handled = set()
+        for path, before in pre_images.items():
+            handled.add(path)
+            try:
+                after = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if isinstance(before, str) and before == after:
+                continue
+            entry = self._pending.get(path)
+            if entry is None:
+                self._pending[path] = {"original": before, "after": after}
+                changed = True
+            else:
+                entry["after"] = after
+                changed = True
+                if entry.get("after") == entry.get("original"):
+                    self._pending.pop(path, None)
+                    removed = True
+        # Bash 等未经过写入工具拦截的改动：用本轮开始前的快照兜底
+        for path, after in current.items():
+            if path in handled:
+                continue
+            before = turn_files.get(path)
+            if before == after:
+                continue
+            entry = self._pending.get(path)
+            if entry is None:
+                self._pending[path] = {"original": before, "after": after}
+                changed = True
+            else:
+                entry["after"] = after
+                changed = True
+                if entry.get("after") == entry.get("original"):
+                    self._pending.pop(path, None)
+                    removed = True
+        self._turn_files = {}
+        if not changed and not removed:
+            return
+        self._refresh_tree_marks()
+        self._refresh_viewer_marks()
+        if self.mode == "all":
+            # 自动覆盖模式：不弹预览、不等确认，直接写入磁盘。
+            self._auto_apply_pending()
+        else:
+            self._show_diff_view()
+        # 起点只由用户点「标记节点」决定，AI 修改后不再自动挪动。
+        self._schedule_dev_record_save()
+
+    def _auto_apply_pending(self):
+        """把当前所有待确认改动直接写回磁盘，并记入 ↶ 撤回历史。"""
+        history = []
+        for path, entry in list(self._pending.items()):
+            after = entry.get("after", "")
+            try:
+                before = Path(path).read_text(
+                    encoding="utf-8", errors="ignore")
+            except FileNotFoundError:
+                before = None
+            except OSError:
+                before = entry.get("original")
+            try:
+                Path(path).write_text(after, encoding="utf-8")
+            except OSError as exc:
+                self.status_label.setText(f"自动覆盖失败：{exc}")
+                continue
+            history.append((path, before, after))
+            self._pending.pop(path, None)
+        self._push_file_history(history)
+        if history:
+            self._after_bulk_change(f"已自动覆盖 {len(history)} 个文件")
+        else:
+            self._hide_diff_view()
+        self._update_buttons()
+
+    def _show_diff_view(self):
+        """在开发页内显示改前/改后对比，并暂时收起代码目录栏。"""
+        if not self._pending:
+            self.status_label.setText("当前没有待确认的修改")
+            self._hide_diff_view()
+            return
+        self.diff_panel.refresh()
+        self.file_row_widget.setVisible(False)
+        self.right_stack.setCurrentWidget(self.diff_panel)
+        if not self.isVisible():
+            self.reveal_requested.emit()
+
+    def _hide_diff_view(self):
+        """收起对比，恢复代码目录和编辑器。"""
+        if self._diff_panel is not None:
+            self.right_stack.setCurrentWidget(self.right_splitter)
+        self.file_row_widget.setVisible(True)
+
+    def _store_diff_editor(self):
+        if self._diff_panel is not None:
+            self._diff_panel.store_editor()
+
+    def confirm_current_change(self):
+        self._store_diff_editor()
+        path = (self._diff_panel.current_path()
+                if self._diff_panel is not None else None)
+        if path is None:
+            return
+        entry = self._pending.get(path)
+        if entry is None:
+            return
+        after = entry.get("after", "")
+        try:
+            before = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except FileNotFoundError:
+            before = None
+        except OSError:
+            before = entry.get("original")
+        try:
+            Path(path).write_text(after, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "确认修改", f"写入失败：{exc}")
+            return
+        self._push_file_history([(path, before, after)])
+        self._pending.pop(path, None)
+        self._after_change_removed(path, f"已确认并覆盖：{self._display_path(path)}")
+
+    def cancel_current_change(self):
+        path = (self._diff_panel.current_path()
+                if self._diff_panel is not None else None)
+        if path is None:
+            return
+        entry = self._pending.get(path)
+        if entry is None:
+            return
+        original = entry.get("original")
+        try:
+            if original is None:
+                Path(path).unlink(missing_ok=True)
+            else:
+                Path(path).write_text(original, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "取消修改", f"还原失败：{exc}")
+            return
+        self._pending.pop(path, None)
+        self._after_change_removed(path, f"已还原：{self._display_path(path)}")
+
+    def confirm_all_changes(self):
+        self._store_diff_editor()
+        paths = list(self._pending)
+        history = []
+        for path in paths:
+            entry = self._pending.get(path)
+            if entry is None:
+                continue
+            after = entry.get("after", "")
+            try:
+                before = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except FileNotFoundError:
+                before = None
+            except OSError:
+                before = entry.get("original")
+            try:
+                Path(path).write_text(after, encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.warning(self, "确认修改", f"{path}\n{exc}")
+                continue
+            history.append((path, before, after))
+            self._pending.pop(path, None)
+        self._push_file_history(history)
+        self._after_bulk_change(f"已确认 {len(paths)} 个文件的修改")
+
+    def cancel_all_changes(self):
+        paths = list(self._pending)
+        for path in paths:
+            entry = self._pending.get(path)
+            if entry is None:
+                continue
+            original = entry.get("original")
+            try:
+                if original is None:
+                    Path(path).unlink(missing_ok=True)
+                else:
+                    Path(path).write_text(original, encoding="utf-8")
+            except OSError:
+                continue
+            self._pending.pop(path, None)
+        self._after_bulk_change(f"已还原 {len(paths)} 个文件的修改")
+
+    def _after_change_removed(self, path, message):
+        self.status_label.setText(message)
+        self._refresh_tree_marks()
+        if self._entry_for_path(path) is not None:
+            if Path(path).exists():
+                self._reload_file_tab(path)
+            else:
+                self._close_tab_for_path(path)
+        if self._pending:
+            self.diff_panel.refresh()
+        else:
+            self._hide_diff_view()
+        self._schedule_dev_record_save()
+        self._update_buttons()
+        self.status_label.setText(message)
+
+    def _after_bulk_change(self, message):
+        self.status_label.setText(message)
+        self._refresh_tree_marks()
+        for entry in list(self._code_tabs):
+            path = str(entry["path"])
+            if Path(path).exists():
+                self._reload_file_tab(path)
+            else:
+                self._close_tab_for_path(path)
+        self._hide_diff_view()
+        self._schedule_dev_record_save()
+        self._update_buttons()
+        self.status_label.setText(message)
+
+    # --------------------------------------------------- my-code snapshot --
+    def _load_state(self):
+        if not DEV_SNAPSHOT_PATH.is_file():
+            return
+        try:
+            data = json.loads(DEV_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        if list(data.get("roots") or []) != self.roots:
+            return
+        files = data.get("files")
+        if isinstance(files, dict):
+            self._snapshot = {
+                str(k): str(v) for k, v in files.items()
+                if isinstance(k, str) and isinstance(v, str)}
+            self._snapshot_roots = list(self.roots)
+
+    def _save_snapshot(self, files=None):
+        if not self.roots:
+            return
+        if files is None:
+            files = dev_scan_files(self.roots)
+        data = {
+            "roots": list(self.roots),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "files": files,
+        }
+        try:
+            DEV_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DEV_SNAPSHOT_PATH.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except (OSError, ValueError):
+            return
+        self._snapshot = files
+        self._snapshot_roots = list(self.roots)
+        self._refresh_viewer_marks()
+
+    def _snapshot_diff(self, current):
+        added, changed, removed = [], [], []
+        parts = []
+        for path in sorted(current):
+            old = self._snapshot.get(path)
+            if old is None:
+                added.append(path)
+                body = current[path]
+                if len(body) > 4000:
+                    body = body[:4000] + "\n…（已截断）"
+                parts.append(f"### 新文件 {self._display_path(path)}\n{body}")
+            elif old != current[path]:
+                changed.append(path)
+                parts.append(
+                    f"### 改动文件 {self._display_path(path)}\n" +
+                    dev_unified_diff(old, current[path],
+                                     self._display_path(path)))
+        for path in sorted(self._snapshot):
+            if path not in current:
+                removed.append(path)
+                parts.append(f"### 删除文件 {self._display_path(path)}")
+        return parts, added, changed, removed
+
+    def _mark_new_code_start(self):
+        """手动记录「新代码起点」：此后的改动才会被标 ❗ 和送去检查。"""
+        if not self.roots:
+            QMessageBox.information(
+                self, "标记节点", "请先添加代码文件夹。")
+            return
+        # 先把编辑器里未落盘的内容写回磁盘，保证节点记录的是当前代码。
+        if any(e["view"].document().isModified() for e in self._code_tabs):
+            self._autosave_current()
+        self._save_snapshot()
+        self._refresh_tree_marks()
+        self._schedule_dev_record_save()
+        self.status_label.setText(
+            f"已标记新代码起点 · {datetime.now():%H:%M:%S}")
+
+    def _check_my_code(self):
+        if self._busy:
+            return
+        if not self.roots:
+            QMessageBox.information(
+                self, "检查我的新代码", "请先添加代码文件夹。")
+            return
+        # 自动保存后再扫描，避免刚改完的代码还没落盘就被漏掉。
+        if any(e["view"].document().isModified() for e in self._code_tabs):
+            self._autosave_current()
+        current = dev_scan_files(self.roots)
+        if not self._snapshot:
+            self.status_label.setText(
+                "还没有标记新代码起点，请先点上方「标记节点」")
+            QMessageBox.information(
+                self, "检查我的新代码",
+                "还没有标记新代码起点。\n\n"
+                "请先点顶部「标记节点」记录当前代码，"
+                "之后再改动的内容才会被检查。")
+            return
+        parts, added, changed, removed = self._snapshot_diff(current)
+        if not parts:
+            self.status_label.setText(
+                "标记节点之后没有检测到你的新改动")
+            return
+        body = "\n\n".join(parts)
+        if len(body) > 26000:
+            body = body[:26000] + "\n…（检查内容已截断）"
+        prompt = (
+            "【代码检查（只读）】\n"
+            "下面是用户在「标记节点」之后自己写的新代码改动。\n"
+            "请检查这些改动有没有问题：逻辑错误、边界条件、异常处理、"
+            "并发/资源泄漏、命名与可维护性、与现有接口不一致等。\n"
+            "不要修改文件，不要调用 Write/Edit/Bash；只输出问题清单。\n"
+            "每条问题给出：文件与行号、严重程度（高/中/低）、原因、修改建议。"
+            "如果没有明显问题，也请明确说明。\n\n"
+            f"<<<\n{body}\n>>>")
+        display = (f"检查我的新代码：{len(changed)} 个修改文件、"
+                   f"{len(added)} 个新文件、{len(removed)} 个删除文件")
+        # 检查不会自动挪动起点；需要下次从这里重新算时，手动点「标记节点」。
+        self._start_send(prompt, display, deny_writes=True)
+
+    # ------------------------------------------------------------- QA window --
+    def _show_qa_window(self):
+        window = self._qa_window
+        if window is None:
+            self._build_qa_window()
+            window = self._qa_window
+        if not window.isVisible():
+            anchor = self.window().frameGeometry()
+            window.move(
+                max(anchor.left() + 40, anchor.right() - window.width() - 40),
+                anchor.top() + 80)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _build_qa_window(self):
+        window = DevQaWindow()
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        head = QHBoxLayout()
+        title = QLabel("开发问答")
+        title.setObjectName("H2")
+        recall = QLabel("Ctrl+Shift+E 召回；发送后对话同步到主页面")
+        recall.setObjectName("Muted")
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(recall)
+        layout.addLayout(head)
+
+        self._qa_view = QTextBrowser()
+        self._qa_view.setStyleSheet(
+            "QTextBrowser { background: #fffafc; border: 1px solid #f6d9e6;"
+            " border-radius: 8px; padding: 8px; color: #4b3742; }")
+        self._qa_view.setPlaceholderText(
+            "可以在这里直接提问，也可以先选中一段代码再问")
+        layout.addWidget(self._qa_view, 1)
+
+        self._qa_input = ChatInput()
+        self._qa_input.setObjectName("ChatInput")
+        self._qa_input.setFixedHeight(84)
+        self._qa_input.setPlaceholderText("Enter 发送，Shift+Enter 换行")
+        self._qa_input.submitted.connect(self._send_qa)
+        layout.addWidget(self._qa_input)
+
+        bottom = QHBoxLayout()
+        self._qa_status = QLabel("")
+        self._qa_status.setObjectName("Muted")
+        bottom.addWidget(self._qa_status, 1)
+        self._qa_send = QPushButton("发送")
+        self._qa_send.setObjectName("Primary")
+        self._qa_send.clicked.connect(self._send_qa)
+        bottom.addWidget(self._qa_send)
+        layout.addLayout(bottom)
+
+        window.setCentralWidget(container)
+        self._qa_window = window
+        self._render_qa_chat()
+        self._update_buttons()
+
+    def _qa_context(self):
+        lines = ["【代码开发 · 独立问答（只读）】", "可访问的文件夹："]
+        lines.extend(f"- {root}" for root in self.roots)
+        if self._current_file:
+            lines.append(f"当前文件：{self._current_file}")
+        lines.append(
+            "这是一个与主开发对话相互独立的问答会话。"
+            "不要修改文件，不要调用 Write/Edit/Bash；只根据代码回答问题。")
+        return "\n".join(lines)
+
+    def _ensure_qa_worker(self):
+        if self._qa_worker is None:
+            worker = ClaudeWorker(self)
+            worker.text_delta.connect(self._on_qa_delta)
+            worker.assistant.connect(self._on_qa_assistant)
+            worker.result.connect(self._on_qa_result)
+            worker.error.connect(self._on_qa_error)
+            worker.busy_changed.connect(self._on_qa_busy)
+            self._qa_worker = worker
+            worker.start()
+        self._qa_worker.set_dev_policy(self.roots, self.mode)
+        root = self.roots[0] if self.roots else ""
+        cfg = (root, self.model, self.effort)
+        if self._qa_worker_cfg != cfg:
+            self._qa_worker.configure(
+                root, "default", model=self.model, effort=self.effort)
+            self._qa_worker_cfg = cfg
+            self._qa_worker.set_dev_policy(self.roots, self.mode)
+        return self._qa_worker
+
+    def _on_qa_delta(self, chunk):
+        self._qa_live += chunk
+        self._qa_dirty = True
+        if not self._qa_timer.isActive():
+            self._qa_timer.start()
+
+    def _on_qa_assistant(self, text, _tools):
+        if (text or "").strip():
+            self._qa_live = ""
+            self._append_qa_message("assistant", text)
+
+    def _on_qa_result(self, _info):
+        self._qa_live = ""
+        self._qa_busy = False
+        self._qa_status.setText("就绪")
+        self._render_qa_chat()
+        self._update_buttons()
+
+    def _on_qa_error(self, message):
+        self._qa_live = ""
+        self._append_qa_message("assistant", f"⚠️ {message}")
+        self._qa_status.setText("出错")
+
+    def _on_qa_busy(self, busy):
+        self._qa_busy = bool(busy)
+        self._qa_status.setText("Claude 正在回答…" if busy else "就绪")
+        self._update_buttons()
+
+    def _send_qa(self):
+        text = self._qa_input.toPlainText().strip()
+        if not text or self._qa_busy:
+            return
+        if not self.roots:
+            QMessageBox.information(
+                self, "开发问答", "请先添加至少一个允许访问的代码文件夹。")
+            return
+        if not SDK_AVAILABLE:
+            QMessageBox.warning(
+                self, "缺少对话组件",
+                f"未安装 Claude Agent SDK，无法在界面内提问。\n\n{SDK_IMPORT_ERROR}")
+            return
+        worker = self._ensure_qa_worker()
+        worker.begin_dev_turn(deny_writes=True)
+        self._append_qa_message("user", text)
+        self._qa_live = ""
+        self._qa_busy = True
+        self._qa_status.setText("Claude 正在回答…")
+        self._update_buttons()
+        self._qa_input.clear()
+        prompt = self._qa_context() + "\n\n用户问题：\n" + text
+        if not worker.send(prompt):
+            self._qa_busy = False
+            self._qa_status.setText("发送失败")
+            self._update_buttons()
+
+    # ------------------------------------------------------------- shutdown --
+    def shutdown(self):
+        timer = getattr(self, "_chat_timer", None)
+        if timer is not None:
+            timer.stop()
+        qa_timer = getattr(self, "_qa_timer", None)
+        if qa_timer is not None:
+            qa_timer.stop()
+        worker = self._worker
+        if worker is not None:
+            worker.shutdown()
+            self._worker = None
+        qa_worker = self._qa_worker
+        if qa_worker is not None:
+            qa_worker.shutdown()
+            self._qa_worker = None
+        if self._qa_window is not None:
+            self._qa_window.close()
+            self._qa_window.deleteLater()
+        self._qa_window = None
+        self._qa_view = None
+        self._diff_panel = None
+
+
+
+
 class PermissionDialog(QDialog):
-    def __init__(self, tool_name, input_text, parent=None):
+    def __init__(self, tool_name, input_text, parent=None, note=""):
         super().__init__(parent)
         self.setWindowTitle("权限确认")
         self.setModal(True)
@@ -4141,6 +7084,14 @@ class PermissionDialog(QDialog):
         title = QLabel("Claude 请求执行一个操作")
         title.setObjectName("H1")
         layout.addWidget(title)
+
+        if note:
+            note_label = QLabel(note)
+            note_label.setWordWrap(True)
+            note_label.setStyleSheet(
+                "QLabel { background: #fff4e5; border: 1px solid #f3c98b;"
+                " border-radius: 8px; padding: 8px; color: #8a5a13; }")
+            layout.addWidget(note_label)
 
         label = TOOL_LABELS.get(tool_name, tool_name)
         detail = QLabel(f"工具：{label}（{tool_name}）")
@@ -4506,6 +7457,93 @@ class PluginPickerDialog(QDialog):
         return self._selected.get("pluginId") or self._selected.get("name")
 
 
+class ProgressPopup(QFrame):
+    """「进度查询」按钮上方的小浮窗，点击浮窗以外的任意位置关闭。"""
+
+    def __init__(self, parent=None):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setObjectName("ProgressPopup")
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self._anchor = None
+        self._filtering = False
+        self._label = QLabel(self)
+        self._label.setTextFormat(Qt.RichText)
+        self._label.setWordWrap(True)
+        self._label.setMinimumWidth(300)
+        self._label.setMaximumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.addWidget(self._label)
+        self.setStyleSheet(
+            "QFrame#ProgressPopup { background-color: #ffffff;"
+            " border: 1px solid #f0c9da; border-radius: 10px; }"
+            "QFrame#ProgressPopup QLabel { color: #5a3f4b; font-size: 12px;"
+            " background: transparent; }")
+
+    def show_for(self, anchor: QWidget, markup: str) -> None:
+        self._anchor = anchor
+        self._label.setText(markup)
+        self.adjustSize()
+        pos = anchor.mapToGlobal(QPoint(anchor.width() // 2, 0))
+        screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
+        x = pos.x() - self.width() // 2
+        y = pos.y() - self.height() - 8
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left() + 8,
+                    min(x, area.right() - self.width() - 8))
+            if y < area.top() + 8:
+                # 上方放不下时改到按钮下方
+                y = anchor.mapToGlobal(
+                    QPoint(anchor.width() // 2, anchor.height())).y() + 8
+            y = max(area.top() + 8,
+                    min(y, area.bottom() - self.height() - 8))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self._attach_filter()
+
+    def _attach_filter(self) -> None:
+        app = QApplication.instance()
+        if app is not None and not self._filtering:
+            app.installEventFilter(self)
+            self._filtering = True
+
+    def _detach_filter(self) -> None:
+        if self._filtering:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self._filtering = False
+
+    def _is_inside_anchor(self, global_pos: QPoint) -> bool:
+        anchor = self._anchor
+        if anchor is None or not anchor.isVisible():
+            return False
+        rect = QRect(anchor.mapToGlobal(QPoint(0, 0)), anchor.size())
+        return rect.contains(global_pos)
+
+    def eventFilter(self, obj, event):
+        if self.isVisible():
+            etype = event.type()
+            if etype == QEvent.MouseButtonPress:
+                # 兼容 Qt5/Qt6 的全局坐标接口
+                global_pos = event.globalPos() if hasattr(event, "globalPos") \
+                    else event.globalPosition().toPoint()
+                if not self.geometry().contains(global_pos) \
+                        and not self._is_inside_anchor(global_pos):
+                    self.hide()
+            elif etype == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+                self.hide()
+                return True
+        return super().eventFilter(obj, event)
+
+    def hideEvent(self, event):
+        self._detach_filter()
+        super().hideEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4572,6 +7610,10 @@ class MainWindow(QMainWindow):
         self._study_pages = {}
         self._study_windows = {}
         self._pending_study_record = None
+        # 每个项目自己的一份代码开发页；独立窗口也按项目各自持有。
+        # key 为项目路径（未选择项目时是空字符串）。
+        self._dev_pages = {}
+        self._dev_windows = {}
 
         self._stream_timer = QTimer(self)
         self._stream_timer.setInterval(60)
@@ -4579,6 +7621,18 @@ class MainWindow(QMainWindow):
         self._chat_qa_timer = QTimer(self)
         self._chat_qa_timer.setInterval(80)
         self._chat_qa_timer.timeout.connect(self._flush_chat_qa_live)
+
+        # 进度浮窗：每秒刷新一次，读取真实后台进程的进度/网速/ETA
+        self._progress_refresh_timer = QTimer(self)
+        self._progress_refresh_timer.setInterval(1000)
+        self._progress_refresh_timer.timeout.connect(self._refresh_progress_popup)
+        self._progress_refresh_timer.start()
+        # 后台任务完成提醒：记录已见过的任务，消失时提示"已完成"
+        self._bg_seen_tasks = {}
+        self._bg_watch_timer = QTimer(self)
+        self._bg_watch_timer.setInterval(1000)
+        self._bg_watch_timer.timeout.connect(self._watch_background_tasks)
+        self._bg_watch_timer.start()
 
         self._build_ui()
         self._connect_worker()
@@ -4666,6 +7720,28 @@ class MainWindow(QMainWindow):
             page.set_project(key)
         self._study_pages[key] = page
         return page
+
+    def _dev_page_for(self, path):
+        """取（或创建）某个项目自己的代码开发页。
+
+        每个项目一张页、一个独立窗口，切换项目时互不覆盖。
+        """
+        key = path or ""
+        page = self._dev_pages.get(key)
+        if page is not None:
+            return page
+        page = CodeDevPage(self.config)
+        page.project_key = key
+        page.set_runtime(self._current_model(), self._current_effort())
+        page.float_requested.connect(
+            lambda p=page: self._toggle_dev_float_for(p))
+        page.reveal_requested.connect(
+            lambda p=page: self._show_dev_page_for(p))
+        self._dev_pages[key] = page
+        return page
+
+    def _dev_page_path(self, page):
+        return getattr(page, "project_key", "") if page is not None else ""
 
     def _capture_study_state(self, path):
         """切走项目前，把该项目研读页当前内容与模式存到它自己名下。"""
@@ -4841,6 +7917,8 @@ class MainWindow(QMainWindow):
         # 未选择项目时也有一张研读页，占住页签位置
         self.study_page = self._study_page_for("")
         self.tabs.addTab(self.study_page, "代码研读")
+        self.dev_tab = self._dev_page_for("")
+        self.tabs.addTab(self.dev_tab, "代码开发")
         self.history_tab = self._build_history_tab()
         self.tabs.addTab(self.history_tab, "会话历史")
         self.assets_tab = self._build_assets_tab()
@@ -4865,6 +7943,9 @@ class MainWindow(QMainWindow):
         chat_qa_shortcut = QShortcut(QKeySequence("Ctrl+Shift+W"), self)
         chat_qa_shortcut.setContext(Qt.ApplicationShortcut)
         chat_qa_shortcut.activated.connect(self._show_chat_qa_window)
+        dev_qa_shortcut = QShortcut(QKeySequence("Ctrl+Shift+E"), self)
+        dev_qa_shortcut.setContext(Qt.ApplicationShortcut)
+        dev_qa_shortcut.activated.connect(self._show_dev_qa_window)
 
         return content
 
@@ -5046,6 +8127,12 @@ class MainWindow(QMainWindow):
             "先在对话气泡里选中一段内容，再点这里打开悬浮问答窗（Ctrl+Shift+W 召回）")
         self.btn_ask_selection.clicked.connect(self._ask_chat_selection)
         bottom.addWidget(self.btn_ask_selection)
+        self.btn_progress = QPushButton("进度查询")
+        self.btn_progress.setObjectName("Flat")
+        self.btn_progress.setToolTip(
+            "查看当前任务的权限是否正常、执行进度和预计剩余时间（点击框外任意位置关闭）")
+        self.btn_progress.clicked.connect(self._show_progress_popup)
+        bottom.addWidget(self.btn_progress)
         bottom.addStretch(1)
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setObjectName("Danger")
@@ -5190,6 +8277,8 @@ class MainWindow(QMainWindow):
             return ""
         if isinstance(widget, CodeStudyPage):
             return "study"
+        if isinstance(widget, CodeDevPage):
+            return "dev"
         for key in ("chat", "history", "assets", "commands"):
             if widget is getattr(self, f"{key}_tab", None):
                 return key
@@ -5215,20 +8304,48 @@ class MainWindow(QMainWindow):
             # 研读页可能被搬到独立窗口；此时回到对话页即可
             if self.tabs.indexOf(self.study_page) >= 0:
                 widget = self.study_page
+        elif key == "dev":
+            # 开发页也可能搬到独立窗口；不在页签里就不要硬切
+            dev = getattr(self, "dev_tab", None)
+            if self.tabs.indexOf(dev) >= 0:
+                widget = dev
         else:
             widget = getattr(self, f"{key}_tab", None)
         if widget is None:
             widget = getattr(self, "chat_tab", None)
         index = self.tabs.indexOf(widget) if widget is not None else -1
         if index < 0:
+            widget = getattr(self, "chat_tab", None)
+            index = self.tabs.indexOf(widget) if widget is not None else -1
+        if index < 0:
             return
         self.tabs.blockSignals(True)
         self.tabs.setCurrentIndex(index)
         self.tabs.blockSignals(False)
+        self._stabilize_page_layout(widget)
+
+    def _stabilize_page_layout(self, widget=None):
+        """页签重挂/切换后主动排版一次，避免停在上一个窗口的旧尺寸。"""
+        targets = []
+        for target in (widget, self.tabs.currentWidget()):
+            if target is not None and target not in targets:
+                targets.append(target)
+        for target in targets:
+            target.updateGeometry()
+            layout = target.layout()
+            if layout is not None:
+                layout.activate()
+            for splitter in target.findChildren(QSplitter):
+                splitter.updateGeometry()
 
     def _on_main_tab_changed(self, index):
         self._remember_active_tab()
-        if self.tabs.widget(index) is self.assets_tab:
+        widget = self.tabs.widget(index)
+        if widget is not None:
+            self._stabilize_page_layout(widget)
+            QTimer.singleShot(
+                0, lambda w=widget: self._stabilize_page_layout(w))
+        if widget is self.assets_tab:
             self._refresh_skills()
             if not self._plugins_loaded:
                 self._refresh_plugins()
@@ -5793,6 +8910,7 @@ class MainWindow(QMainWindow):
             self._set_header(None)
             self._reset_chat_for_project()
             self._switch_study_page_to(None)
+            self._switch_dev_page_to(None)
             self._refresh_sessions()
             return
         if selected_row < 0:
@@ -5820,6 +8938,7 @@ class MainWindow(QMainWindow):
             # 每个项目一张常驻研读页：切走只是换页签，内容不会被清空；
             # 已独立的窗口也不参与切换。
             self._switch_study_page_to(self.current_project)
+            self._switch_dev_page_to(self.current_project)
             self._set_study_mode_silently(
                 bool(self._study_state(self.current_project)["mode"]))
             self._study_state_path = self.current_project or ""
@@ -5899,6 +9018,8 @@ class MainWindow(QMainWindow):
         self.config["projects"] = [p for p in self.config["projects"]
                                    if p["path"] != project["path"]]
         save_config(self.config)
+        if project["path"] == (self.current_project or ""):
+            self._reset_dev_for_new_chat()
         self._populate_projects()
         self.statusBar().showMessage("已移除项目", 3000)
 
@@ -6327,9 +9448,14 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event):
         super().changeEvent(event)
         # cc-switch 切换服务商会改写 settings.json，窗口重新激活时自动刷新
-        if (event.type() == QEvent.ActivationChange and self.isActiveWindow()
-                and provider_settings_mtime() != self._settings_mtime):
-            QTimer.singleShot(0, self._refresh_model_catalog)
+        if event.type() == QEvent.ActivationChange:
+            if not self.isActiveWindow():
+                # 切到其他应用时，进度浮窗也算“点击框外”，一并关闭
+                popup = getattr(self, "_progress_popup", None)
+                if popup is not None and popup.isVisible():
+                    popup.hide()
+            elif provider_settings_mtime() != self._settings_mtime:
+                QTimer.singleShot(0, self._refresh_model_catalog)
 
     def _on_model_changed(self, index):
         model = self.model_combo.itemData(index)
@@ -6639,7 +9765,7 @@ class MainWindow(QMainWindow):
         window = ChatQaWindow()
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
         head = QHBoxLayout()
@@ -6666,12 +9792,26 @@ class MainWindow(QMainWindow):
             "可以直接在下方提问；若先在对话里选中一段内容，问题会自动带上引用")
         layout.addWidget(self.chat_qa_view, 1)
 
+        # 问答窗口也支持粘贴/拖入图片：先 OCR，再把识别结果随问题发送
+        self.chat_qa_attachments = []
+        self.chat_qa_attachment_bar = QWidget()
+        self.chat_qa_attachment_bar.setObjectName("AttachmentBar")
+        self.chat_qa_attachment_layout = QHBoxLayout(
+            self.chat_qa_attachment_bar)
+        self.chat_qa_attachment_layout.setContentsMargins(0, 0, 0, 4)
+        self.chat_qa_attachment_layout.setSpacing(8)
+        self.chat_qa_attachment_layout.addStretch(1)
+        self.chat_qa_attachment_bar.setVisible(False)
+        layout.addWidget(self.chat_qa_attachment_bar)
+
         self.chat_qa_input = ChatInput()
         self.chat_qa_input.setObjectName("ChatInput")
         self.chat_qa_input.setFixedHeight(84)
         self.chat_qa_input.setPlaceholderText(
-            "直接输入问题，Enter 发送，Shift+Enter 换行（可选：先在对话里选中内容）")
+            "直接输入问题，Enter 发送，Shift+Enter 换行；"
+            "可粘贴/拖入图片自动识别（可选：先在对话里选中内容）")
         self.chat_qa_input.submitted.connect(self._send_chat_qa)
+        self.chat_qa_input.image_pasted.connect(self._add_chat_qa_image)
         layout.addWidget(self.chat_qa_input)
 
         bottom = QHBoxLayout()
@@ -6746,6 +9886,195 @@ class MainWindow(QMainWindow):
     def _ask_chat_selection_from(self, text, role):
         self._ask_chat_selection(text, role)
 
+    # ------------------------------------------------------------ 进度查询 --
+    def _progress_worker_snapshot(self):
+        """优先报告正在运行的主对话；主对话空闲时报告问答窗口。"""
+        state = self._chat_state()
+        worker = state.get("worker")
+        if worker is not None:
+            snapshot = worker.status_snapshot()
+            if snapshot.get("busy"):
+                return snapshot, "主对话"
+        qa_worker = getattr(self, "_chat_qa_worker", None)
+        if qa_worker is not None:
+            qa_snapshot = qa_worker.status_snapshot()
+            if qa_snapshot.get("busy"):
+                return qa_snapshot, "问答窗口"
+        if worker is not None:
+            return worker.status_snapshot(), "主对话"
+        if qa_worker is not None:
+            return qa_worker.status_snapshot(), "问答窗口"
+        return None, "主对话"
+
+    def _progress_markup(self, snapshot, channel):
+        def fmt_time(seconds):
+            seconds = int(max(0, seconds or 0))
+            return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+        busy = bool(snapshot.get("busy"))
+        pending = int(snapshot.get("pending_permissions") or 0)
+        mode = snapshot.get("permission_mode") or "default"
+        dev_mode = bool(snapshot.get("dev_mode"))
+        tool = str(snapshot.get("last_tool") or "")
+        pending_tools = [
+            str(item) for item in (snapshot.get("pending_tools") or []) if item]
+        if pending_tools:
+            tool = pending_tools[-1] or tool
+        permission_tool = str(snapshot.get("permission_tool") or tool)
+        since = snapshot.get("since_activity")
+        elapsed = snapshot.get("elapsed") or 0.0
+        tool_count = int(snapshot.get("tool_count") or 0)
+        last_error = str(snapshot.get("last_error") or "")
+        # 后台进程（编译/打包/下载）不受对话回合结束影响，单独采样
+        try:
+            bg_snapshot = background_monitor.snapshot()
+        except Exception:
+            bg_snapshot = {}
+        bg_tasks = bg_snapshot.get("tasks") or []
+
+        if dev_mode:
+            permission = "✅ 正常 · 开发模式自动放行"
+        elif mode == "bypassPermissions":
+            permission = "✅ 正常 · 完全访问（不会等待权限）"
+        else:
+            permission = f"✅ 正常 · {permission_display(mode)}"
+            if busy and not pending:
+                permission += "（当前无待确认请求）"
+        if pending:
+            permission = (
+                "⚠️ 等待权限确认：<b>"
+                f"{html.escape(permission_tool or '未知工具')}</b>")
+
+        if not busy:
+            if bg_tasks:
+                progress = "对话回合已结束，但仍有后台任务在运行（见下方）"
+                eta = "请以后台任务的预计剩余时间为准"
+            else:
+                progress = "当前没有运行中的任务"
+                eta = "—"
+            if last_error:
+                progress = f"上一轮出错：{html.escape(last_error[:120])}"
+        elif pending:
+            progress = "⏸ 已暂停，等待你批准或拒绝权限"
+            eta = "授权后约 1–3 分钟（粗略）"
+        else:
+            if since is None:
+                progress = "⏳ 已启动，等待首个输出"
+                eta = "约 1–2 分钟"
+            elif since <= 10:
+                progress = f"✅ 正常推进 · {since:.0f} 秒前仍有输出"
+                eta = "约 1–2 分钟"
+            elif since <= 45:
+                progress = f"✅ 正常 · 最近 {since:.0f} 秒无新输出"
+                eta = "约 2–5 分钟"
+            elif since <= 120:
+                progress = (
+                    f"⚠️ 较慢 · 已 {since:.0f} 秒无输出，可能在执行长任务")
+                eta = "约 3–10 分钟，建议继续观察"
+            else:
+                progress = f"⚠️ 可能卡住 · 已 {since:.0f} 秒无输出"
+                eta = "无法估计，建议检查权限或停止重试"
+            if tool:
+                progress += (
+                    f"<br>最近工具：{html.escape(tool)}"
+                    f"（本轮 {tool_count} 次）")
+            if last_error:
+                progress += (
+                    f"<br>最近错误：{html.escape(last_error[:120])}")
+
+        activity = str(snapshot.get("activity_label") or "")
+        lines = [
+            f"<b>进度查询</b> · {html.escape(channel)}",
+            f"权限：{permission}",
+            f"进度：{progress}",
+            f"预计：{eta}",
+        ]
+        if busy:
+            lines.append(f"已运行：{fmt_time(elapsed)}")
+            if activity:
+                lines.append(f"最近活动：{html.escape(activity)}")
+        lines.extend(background_monitor.render_markup(bg_snapshot))
+        return "<br>".join(lines)
+
+    def _show_progress_popup(self):
+        snapshot, channel = self._progress_worker_snapshot()
+        if snapshot is None:
+            markup = "<b>进度查询</b><br>当前没有可用的对话进程"
+        else:
+            markup = self._progress_markup(snapshot, channel)
+
+        popup = getattr(self, "_progress_popup", None)
+        if popup is None:
+            popup = ProgressPopup(self)
+            self._progress_popup = popup
+        popup.show_for(self.btn_progress, markup)
+
+    def _refresh_progress_popup(self):
+        """浮窗打开期间持续刷新，显示实时进度、网速和预计剩余时间。"""
+        popup = getattr(self, "_progress_popup", None)
+        if popup is None or not popup.isVisible():
+            return
+        snapshot, channel = self._progress_worker_snapshot()
+        if snapshot is None:
+            markup = "<b>进度查询</b><br>当前没有可用的对话进程"
+        else:
+            markup = self._progress_markup(snapshot, channel)
+        popup.show_for(self.btn_progress, markup)
+
+    def _watch_background_tasks(self):
+        """后台任务消失时主动提示，避免回合结束后用户还得反复询问。"""
+        try:
+            snap = background_monitor.snapshot()
+        except Exception:
+            return
+        now = time.monotonic()
+        current = {}
+        for task in snap.get("tasks") or []:
+            pid = task.get("root_pid")
+            if pid is None:
+                continue
+            current[pid] = task
+        for pid, task in current.items():
+            seen = self._bg_seen_tasks.get(pid)
+            if seen is None:
+                self._bg_seen_tasks[pid] = {
+                    "label": task.get("label") or "后台任务",
+                    "start": now - float(task.get("elapsed") or 0.0),
+                }
+            else:
+                seen["label"] = task.get("label") or seen["label"]
+        finished = []
+        for pid in list(self._bg_seen_tasks):
+            if pid in current:
+                continue
+            info = self._bg_seen_tasks.pop(pid)
+            duration = now - info.get("start", now)
+            if duration < 5:
+                continue
+            text = (f"后台任务已完成：{info.get('label') or '任务'}"
+                    f"（用时 {background_monitor.format_duration(duration)}）")
+            finished.append(text)
+            self.statusBar().showMessage(text, 12000)
+            self._notify_desktop(APP_NAME, text)
+        if finished and not current:
+            # 最后一个后台任务结束，恢复对话状态文字
+            try:
+                if self.chat_status.text().startswith("回合已完成"):
+                    self.chat_status.setText("已完成（后台任务已结束）")
+            except Exception:
+                pass
+
+    def _notify_desktop(self, title, text):
+        try:
+            if shutil.which("notify-send"):
+                subprocess.Popen(
+                    ["notify-send", "--app-name", APP_NAME, title, text],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        except Exception:
+            pass
+        QApplication.alert(self)
+
     def _recent_chat_context(self, max_chars=9000):
         lines = []
         for bubble in self._chat_bubbles:
@@ -6784,13 +10113,19 @@ class MainWindow(QMainWindow):
         if not has_ui:
             return
         ready = bool(self.current_project) and SDK_AVAILABLE
-        self.chat_qa_send_btn.setEnabled(ready and not self._chat_qa_busy)
-        self.chat_qa_status.setText(
-            "Claude 正在回答…" if self._chat_qa_busy else "")
+        pending = self._chat_qa_attachments_pending()
+        self.chat_qa_send_btn.setEnabled(
+            ready and not self._chat_qa_busy and not pending)
+        if self._chat_qa_busy:
+            self.chat_qa_status.setText("Claude 正在回答…")
+        elif pending:
+            self.chat_qa_status.setText("图片还在识别中…")
+        else:
+            self.chat_qa_status.setText("")
 
     def _send_chat_qa(self):
         text = self.chat_qa_input.toPlainText().strip()
-        if not text:
+        if not text and not self.chat_qa_attachments:
             return
         if not self.current_project:
             QMessageBox.information(
@@ -6804,18 +10139,23 @@ class MainWindow(QMainWindow):
             return
         if self._chat_qa_busy:
             return
+        if self._chat_qa_attachments_pending():
+            self.chat_qa_status.setText("图片还在识别中，请稍候再发送…")
+            return
+        prompt_text, display_text = self._chat_qa_compose_message(text)
         self._ensure_chat_qa_worker()
         quote = self._chat_qa_pending_quote
         self._chat_qa_pending_quote = ""
         self.chat_qa_quote_hint.setText("未选中文字")
         self.chat_qa_input.clear()
+        self._clear_chat_qa_attachments()
 
         user_id = self._chat_qa_next_id
         self._chat_qa_next_id += 1
         answer_id = self._chat_qa_next_id
         self._chat_qa_next_id += 1
         self._chat_qa_messages.append({
-            "id": user_id, "role": "user", "text": text,
+            "id": user_id, "role": "user", "text": display_text,
             "merged": False, "streaming": False})
         self._chat_qa_messages.append({
             "id": answer_id, "role": "assistant",
@@ -6852,7 +10192,7 @@ class MainWindow(QMainWindow):
         parts += [
             "",
             "用户的问题：",
-            text,
+            prompt_text,
             "",
             "请直接、简洁地回答这个局部疑问，用中文和 Markdown。",
             "如果需要指向源码，请使用 "
@@ -6876,7 +10216,7 @@ class MainWindow(QMainWindow):
             self.chat_qa_view.clear()
             return
         blocks = []
-        for message in self._chat_qa_messages:
+        for message in visible_qa_messages(self._chat_qa_messages):
             role = message.get("role")
             prefix = {"user": "**你**", "assistant": "**Claude**",
                       "error": "**出错**"}.get(role, "**Claude**")
@@ -7348,6 +10688,156 @@ class MainWindow(QMainWindow):
             display = (display + "\n\n" if display else "") + note
         return prompt, display
 
+    # ------------------------------------------- 问答窗口图片附件 --
+    def _chat_qa_attachments_pending(self):
+        return any(att.get("status") == "pending"
+                   for att in getattr(self, "chat_qa_attachments", []))
+
+    def _add_chat_qa_image(self, image):
+        if image is None or image.isNull():
+            return
+        attachments = getattr(self, "chat_qa_attachments", None)
+        layout = getattr(self, "chat_qa_attachment_layout", None)
+        bar = getattr(self, "chat_qa_attachment_bar", None)
+        if attachments is None or layout is None or bar is None:
+            return
+        if len(attachments) >= 8:
+            self.statusBar().showMessage("一次最多附带 8 张图片", 3000)
+            return
+        self._image_seq = getattr(self, "_image_seq", 0) + 1
+        attachment = {
+            "seq": self._image_seq,
+            "png": self._png_bytes(image),
+            "text": "",
+            "status": "pending",
+            "error": "",
+            "widget": None,
+            "worker": None,
+        }
+
+        chip = QFrame()
+        chip.setObjectName("AttachmentChip")
+        chip.setFixedHeight(58)
+        row = QHBoxLayout(chip)
+        row.setContentsMargins(6, 5, 6, 5)
+        row.setSpacing(7)
+
+        preview = QLabel()
+        preview.setFixedSize(46, 46)
+        preview.setAlignment(Qt.AlignCenter)
+        preview.setPixmap(QPixmap.fromImage(image).scaled(
+            46, 46, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        row.addWidget(preview)
+
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        title = QLabel(f"图片 {attachment['seq']}")
+        title.setObjectName("AttachmentTitle")
+        status = QLabel("识别中…")
+        status.setObjectName("AttachmentStatus")
+        info.addWidget(title)
+        info.addWidget(status)
+        row.addLayout(info)
+
+        remove = QToolButton()
+        remove.setObjectName("Small")
+        remove.setText("✕")
+        remove.setToolTip("移除这张图片")
+        remove.clicked.connect(
+            lambda _checked=False, att=attachment:
+            self._remove_chat_qa_attachment(att))
+        row.addWidget(remove)
+
+        attachment["widget"] = chip
+        attachment["status_label"] = status
+        attachments.append(attachment)
+        layout.insertWidget(layout.count() - 1, chip)
+        bar.setVisible(True)
+        self._update_chat_qa_buttons()
+
+        ok, reason = image_ocr.available()
+        if not ok:
+            self._finish_chat_qa_ocr(
+                attachment, "", f"识别组件不可用：{reason}")
+            return
+        worker = WorkerThread(
+            image_ocr.recognize_bytes, attachment["png"], parent=self)
+        attachment["worker"] = worker
+        worker.succeeded.connect(
+            lambda result, att=attachment:
+            self._finish_chat_qa_ocr(att, result, ""))
+        worker.failed.connect(
+            lambda message, att=attachment:
+            self._finish_chat_qa_ocr(att, "", message))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _finish_chat_qa_ocr(self, attachment, text, error):
+        attachment["worker"] = None
+        if attachment not in getattr(self, "chat_qa_attachments", []):
+            return
+        label = attachment.get("status_label")
+        if error or not str(text).strip():
+            attachment["status"] = "error" if error else "empty"
+            attachment["error"] = error
+            attachment["text"] = ""
+            if label is not None:
+                label.setText("未识别出文字" if not error else "识别失败")
+                label.setToolTip(error)
+            if error:
+                self.statusBar().showMessage(
+                    f"图片识别失败：{error}", 5000)
+        else:
+            attachment["status"] = "done"
+            attachment["text"] = str(text)
+            char_count = len(str(text).replace("\n", ""))
+            if label is not None:
+                label.setText(f"已识别 {char_count} 字")
+                label.setToolTip(str(text)[:2000])
+        self._update_chat_qa_buttons()
+
+    def _remove_chat_qa_attachment(self, attachment):
+        worker = attachment.get("worker")
+        if worker is not None:
+            worker.request_cancel()
+        widget = attachment.get("widget")
+        attachments = getattr(self, "chat_qa_attachments", [])
+        if attachment in attachments:
+            attachments.remove(attachment)
+        layout = getattr(self, "chat_qa_attachment_layout", None)
+        if widget is not None and layout is not None:
+            layout.removeWidget(widget)
+            widget.deleteLater()
+        bar = getattr(self, "chat_qa_attachment_bar", None)
+        if bar is not None:
+            bar.setVisible(bool(attachments))
+        self._update_chat_qa_buttons()
+
+    def _clear_chat_qa_attachments(self):
+        for attachment in list(getattr(self, "chat_qa_attachments", [])):
+            self._remove_chat_qa_attachment(attachment)
+
+    def _chat_qa_compose_message(self, text):
+        pieces = []
+        attachments = getattr(self, "chat_qa_attachments", [])
+        for attachment in attachments:
+            seq = attachment["seq"]
+            recognized = attachment.get("text", "").strip()
+            if recognized:
+                pieces.append(
+                    f"【图片 {seq} 的文字识别结果】\n{recognized}")
+            else:
+                pieces.append(f"【图片 {seq}】未识别出文字。")
+        prompt = text
+        if pieces:
+            prompt = (text + "\n\n" if text else "") + "\n\n".join(pieces)
+        display = text
+        if attachments:
+            note = (
+                f"[已附带 {len(attachments)} 张图片，识别结果随消息发送]")
+            display = (display + "\n\n" if display else "") + note
+        return prompt, display
+
     def _style_study_mode_button(self, checked):
         # 当前会话启用研读模式时把按钮标绿，一眼能看出消息会被路由到解释栏
         if checked:
@@ -7440,6 +10930,50 @@ class MainWindow(QMainWindow):
         eff = self._current_effort() if effort is None else effort
         for page in self._study_pages.values():
             page.set_runtime(perm, mdl, eff)
+        for page in getattr(self, "_dev_pages", {}).values():
+            page.set_runtime(mdl, eff, perm)
+
+    def _show_dev_page(self):
+        self._show_dev_page_for(getattr(self, "dev_tab", None))
+
+    def _show_dev_page_for(self, page):
+        """把某项目的代码开发页带到前台（独立窗口则前置窗口，否则切页签）。"""
+        if page is None:
+            return
+        path = self._dev_page_path(page)
+        window = self._dev_windows.get(path)
+        if window is not None:
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            return
+        if path != (self.current_project or ""):
+            self._select_project_path(path)
+        index = self.tabs.indexOf(page)
+        if index >= 0:
+            self.tabs.setCurrentIndex(index)
+
+    def _reset_dev_for_new_chat(self):
+        """新对话时收起当前项目的代码开发页，像代码研读一样回到干净状态。"""
+        dev = getattr(self, "dev_tab", None)
+        path = self._dev_page_path(dev)
+        if path in self._dev_windows and path == (self.current_project or ""):
+            self._reattach_dev_page(path)
+        if dev is not None:
+            dev.reset_for_new_chat()
+
+    def _show_dev_qa_window(self):
+        dev = getattr(self, "dev_tab", None)
+        if dev is None:
+            return
+        window = self._dev_windows.get(self._dev_page_path(dev))
+        if window is not None:
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        else:
+            self.tabs.setCurrentWidget(dev)
+        dev._show_qa_window()
 
     def _show_current_qa_window(self):
         page = self.study_page
@@ -7450,11 +10984,19 @@ class MainWindow(QMainWindow):
         """把某项目的研读页挂进主窗口页签（如果它已经在页签里就不动）。"""
         if page is None or self.tabs.indexOf(page) >= 0:
             return
-        index = min(max(1, self._study_tab_index), self.tabs.count())
+        # 固定在「代码开发」页签之前，避免反复挂载后页签顺序漂移。
+        dev_index = self.tabs.indexOf(getattr(self, "dev_tab", None))
+        index = dev_index if dev_index >= 0 else 1
+        index = max(1, min(index, self.tabs.count()))
         self.tabs.insertTab(index, page, "代码研读")
         self._study_tab_index = self.tabs.indexOf(page)
         self.tabs.setTabToolTip(index, f"代码研读 · {page.root or '未选择项目'}")
-        page.show()
+        # 不要在这里 page.show()：QTabWidget 只会显示当前页。强行 show 会让
+        # 非当前的研读页和代码开发页同时可见、文字互相叠在一起，切换项目后
+        # 看起来就像“排版错乱”。
+        page.setVisible(self.tabs.currentWidget() is page)
+        self._stabilize_page_layout(page)
+        QTimer.singleShot(0, lambda p=page: self._stabilize_page_layout(p))
 
     def _detach_study_tab(self, page):
         """把研读页从主窗口页签里取下（页面对象继续保留）。"""
@@ -7492,6 +11034,25 @@ class MainWindow(QMainWindow):
             self._current_permission_mode(),
             self._current_model(), self._current_effort())
         self._sync_study_float_button(floating)
+
+    def _switch_dev_page_to(self, path):
+        """切换主窗口当前显示的项目代码开发页。
+
+        已独立成窗口的页面不参与切换，窗口内容保持原样。
+        """
+        key = path or ""
+        new_page = self._dev_page_for(key)
+        old_page = getattr(self, "dev_tab", None)
+        if old_page is not new_page:
+            if old_page is not None and self.tabs.indexOf(old_page) >= 0:
+                self._detach_dev_tab(old_page)
+            self.dev_tab = new_page
+        floating = self._dev_windows.get(key) is not None
+        if not floating:
+            self._attach_dev_tab(new_page)
+        new_page.set_runtime(
+            self._current_model(), self._current_effort(),
+            self._current_permission_mode())
 
     def _show_study_page(self):
         self._show_study_page_for(self.study_page)
@@ -7558,8 +11119,15 @@ class MainWindow(QMainWindow):
         window.setWindowIcon(make_app_icon())
         window.resize(1350, 820)
         window.closed.connect(lambda p=key: self._reattach_study_page(p))
-        page.setParent(window)
-        window.setCentralWidget(page)
+        # 独立窗口四周留一点页边距，避免页面紧贴窗口边缘。
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(10, 10, 10, 10)
+        holder_layout.setSpacing(0)
+        page.setParent(holder)
+        holder_layout.addWidget(page)
+        window.setCentralWidget(holder)
+        window._page = page
         # removeTab/setParent 会把页面显式隐藏；QMainWindow.show() 不会自动
         # 重新显示被显式隐藏的子控件，必须手动 show，否则独立窗口一片空白。
         page.show()
@@ -7576,7 +11144,9 @@ class MainWindow(QMainWindow):
         if window is None:
             return
         window.blockSignals(True)
-        page = window.takeCentralWidget()
+        holder = window.takeCentralWidget()
+        page = getattr(window, "_page", None)
+        window._page = None
         if page is not None:
             page.setParent(self.tabs)
             page.set_floating(False)
@@ -7586,6 +11156,8 @@ class MainWindow(QMainWindow):
             else:
                 # 后台项目的窗口收起来了：页签等切到该项目时再挂
                 page.hide()
+        if holder is not None:
+            holder.deleteLater()
         if key == (self.current_project or ""):
             self._sync_study_float_button(False)
         window.close()
@@ -7598,6 +11170,111 @@ class MainWindow(QMainWindow):
         self.btn_study_float.setChecked(floating)
         self.btn_study_float.setText("收回页签" if floating else "独立窗口")
         self.btn_study_float.blockSignals(False)
+
+    # ------------------------------------------- 代码开发页独立窗口 --
+    def _toggle_dev_float(self):
+        self._toggle_dev_float_for(getattr(self, "dev_tab", None))
+
+    def _toggle_dev_float_for(self, page):
+        if page is None:
+            return
+        path = self._dev_page_path(page)
+        if path in self._dev_windows:
+            if path != (self.current_project or ""):
+                self._select_project_path(path)
+            self._reattach_dev_page(path)
+        else:
+            self._detach_dev_page(path)
+
+    def _attach_dev_tab(self, page=None):
+        """把某项目的开发页挂回主窗口页签，固定在研读页之后。"""
+        dev = page if page is not None else getattr(self, "dev_tab", None)
+        if dev is None or self.tabs.indexOf(dev) >= 0:
+            return
+        study_index = self.tabs.indexOf(getattr(self, "study_page", None))
+        index = study_index + 1 if study_index >= 0 else 1
+        index = max(1, min(index, self.tabs.count()))
+        self.tabs.insertTab(index, dev, "代码开发")
+        self.tabs.setTabToolTip(
+            index, f"代码开发 · {Path(self._dev_page_path(dev)).name}"
+            if self._dev_page_path(dev) else "代码开发")
+        dev.setVisible(self.tabs.currentWidget() is dev)
+        self._stabilize_page_layout(dev)
+        QTimer.singleShot(0, lambda: self._stabilize_page_layout(dev))
+
+    def _detach_dev_tab(self, page):
+        """把开发页从主窗口页签里取下（页面对象继续保留）。"""
+        if page is None:
+            return
+        index = self.tabs.indexOf(page)
+        if index < 0:
+            return
+        previous = getattr(self, "_suppress_tab_remember", False)
+        self._suppress_tab_remember = True
+        try:
+            self.tabs.removeTab(index)
+            page.hide()
+        finally:
+            self._suppress_tab_remember = previous
+
+    def _detach_dev_page(self, path=None):
+        key = (self.current_project or "") if path is None else path
+        page = self._dev_page_for(key)
+        if key in self._dev_windows:
+            return
+        if self.tabs.indexOf(page) >= 0:
+            self._detach_dev_tab(page)
+        if key == (self.current_project or ""):
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentWidget(self.chat_tab)
+            self.tabs.blockSignals(False)
+            self._chat_state(key)["tab"] = "chat"
+        window = DevFloatWindow(self)
+        window.setWindowTitle(
+            f"代码开发 · {Path(key).name}" if key else f"代码开发 · {APP_NAME}")
+        window.setWindowIcon(make_app_icon())
+        window.resize(1350, 820)
+        window.closed.connect(lambda p=key: self._reattach_dev_page(p))
+        # 独立窗口四周留一点页边距，避免页面紧贴窗口边缘。
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(10, 10, 10, 10)
+        holder_layout.setSpacing(0)
+        page.setParent(holder)
+        holder_layout.addWidget(page)
+        window.setCentralWidget(holder)
+        window._page = page
+        # removeTab/setParent 会显式隐藏页面，必须手动 show 才不是空白窗口。
+        page.show()
+        page.set_floating(True)
+        self._dev_windows[key] = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _reattach_dev_page(self, path=None):
+        key = (self.current_project or "") if path is None else path
+        window = self._dev_windows.pop(key, None)
+        if window is None:
+            return
+        window.blockSignals(True)
+        holder = window.takeCentralWidget()
+        dev = getattr(window, "_page", None)
+        window._page = None
+        if dev is not None:
+            dev.setParent(self.tabs)
+            dev.set_floating(False)
+            if key == (self.current_project or ""):
+                self._attach_dev_tab(dev)
+                self.tabs.setCurrentWidget(dev)
+                self._stabilize_page_layout(dev)
+            else:
+                # 后台项目的窗口收起来了：等切到该项目时再挂页签
+                dev.hide()
+        if holder is not None:
+            holder.deleteLater()
+        window.close()
+        window.deleteLater()
 
     def _ensure_live_bubble(self):
         if self._live_bubble is None:
@@ -7700,6 +11377,13 @@ class MainWindow(QMainWindow):
                 page.explain_status.setText("研读出错")
         else:
             label = "已完成"
+            # 回合结束 ≠ 后台任务结束：编译/打包/下载可能还在跑
+            try:
+                bg_tasks = background_monitor.snapshot().get("tasks") or []
+            except Exception:
+                bg_tasks = []
+            if bg_tasks:
+                label = f"回合已完成 · 后台 {len(bg_tasks)} 个任务运行中"
             cost = info.get("cost")
             if isinstance(cost, (int, float)) and cost > 0:
                 label += f" · ${cost:.4f}"
@@ -7788,6 +11472,8 @@ class MainWindow(QMainWindow):
         self._clear_quote()
         self._clear_chat_view()
         self._clear_attachments()
+        # 代码开发会话跟随对话关闭：清空对话与待确认改动，收起独立窗口
+        self._reset_dev_for_new_chat()
         self._show_empty_state("新对话已准备好\n在下方输入消息开始")
         self.chat_status.setText("新对话")
         self.tabs.setCurrentIndex(0)
@@ -7942,7 +11628,44 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(250, self._refresh_sessions)
         return super().event(event)
 
+    def _has_unfinished_work(self):
+        """是否还有正在生成、尚未完成的回复。"""
+        try:
+            for state in getattr(self, "_chat_states", {}).values():
+                worker = state.get("worker")
+                if state.get("busy") or (worker is not None
+                                         and worker.busy):
+                    return True
+            if getattr(self, "_chat_qa_busy", False):
+                return True
+            for page in getattr(self, "_study_pages", {}).values():
+                if getattr(page, "_qa_busy", False):
+                    return True
+            for page in getattr(self, "_dev_pages", {}).values():
+                if (getattr(page, "_busy", False)
+                        or getattr(page, "_qa_busy", False)):
+                    return True
+        except Exception:  # noqa: BLE001 - 关闭检查不应阻止退出
+            pass
+        return False
+
     def closeEvent(self, event):
+        if getattr(self, "_closing", False):
+            super().closeEvent(event)
+            return
+        pending = self._has_unfinished_work()
+        if pending:
+            message = ("还有回复正在生成，关闭会中断当前回复。\n\n"
+                       "确定要退出 Claude 控制台吗？")
+        else:
+            message = "确定要退出 Claude 控制台吗？"
+        answer = QMessageBox.question(
+            self, "退出确认", message,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self._closing = False
+            event.ignore()
+            return
         self._closing = True
         try:
             self.config["geometry"] = bytes(
@@ -7979,6 +11702,12 @@ class MainWindow(QMainWindow):
                 window.close()
             getattr(self, "_study_windows", {}).clear()
             for page in list(getattr(self, "_study_pages", {}).values()):
+                page.shutdown()
+            for window in list(getattr(self, "_dev_windows", {}).values()):
+                window.blockSignals(True)
+                window.close()
+            getattr(self, "_dev_windows", {}).clear()
+            for page in list(getattr(self, "_dev_pages", {}).values()):
                 page.shutdown()
         finally:
             super().closeEvent(event)
