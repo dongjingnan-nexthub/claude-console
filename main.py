@@ -30,13 +30,14 @@ from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics,
                          QGuiApplication, QIcon, QImage, QKeySequence, QPainter,
                          QPixmap, QSyntaxHighlighter, QTextCharFormat,
                          QTextCursor, QTextFormat)
-from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
-                             QCompleter, QDialog, QFileDialog, QFormLayout,
-                             QFrame, QFileSystemModel, QHBoxLayout,
-                             QInputDialog, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QListView, QMainWindow, QMenu,
-                             QMessageBox, QPlainTextEdit, QProgressBar,
-                             QPushButton, QScrollArea, QShortcut, QSpinBox,
+from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
+                             QComboBox, QCompleter, QDialog, QFileDialog,
+                             QFormLayout, QFrame, QFileSystemModel,
+                             QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                             QListWidget, QListWidgetItem, QListView,
+                             QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+                             QProgressBar, QPushButton, QScrollArea,
+                             QShortcut, QSlider, QSpinBox,
                              QSplitter, QStackedWidget, QTabWidget,
                              QTextBrowser, QTextEdit, QToolButton, QTreeView,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout,
@@ -44,12 +45,14 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
 
 import agent_shared as shared_agents
 import background_monitor
+import dual_ai
 import image_ocr
 
 # --------------------------------------------------------------------------- #
 # 常量 & 依赖
 # --------------------------------------------------------------------------- #
 APP_NAME = "Claude 控制台"
+APP_VERSION = "2.0"
 ACCENT = "#E4638C"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -102,6 +105,16 @@ DEFAULT_CONFIG = {
     "permission_mode": "default",
     "model": "",
     "effort": "high",
+    # 双 AI 协作：主 AI / 执行 AI 的模型与协作档次
+    "dual_mode": False,
+    "dual_master": {},
+    "dual_worker": {},
+    "dual_tier": "balanced",
+    # 完成后是否让主 AI 独立复查；默认开启，兼容旧配置。
+    "dual_review_enabled": True,
+    # 旧配置仅用于一次性迁移：dual_share / dual_strategy 不再参与调度。
+    "dual_share": 30,
+    "dual_strategy": "complete",
     # 代码开发页：允许修改的文件夹与修改模式
     "dev_roots": [],
     "dev_mode": "function",
@@ -463,18 +476,25 @@ def load_config():
         cfg["projects"] = default_projects()
         return cfg
     cfg = dict(DEFAULT_CONFIG)
+    migrate_tier = False
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         for key, default in DEFAULT_CONFIG.items():
             value = data.get(key)
             if isinstance(value, type(default)):
                 cfg[key] = value
+        # 合并默认值后就无法区分旧配置；在这里用原始键完成迁移。
+        if not data.get("dual_tier"):
+            cfg["dual_tier"] = dual_ai.normalize_tier(cfg["dual_share"])
+            migrate_tier = True
     except (OSError, ValueError):
         pass
     cfg["projects"] = [
         p for p in cfg["projects"]
         if isinstance(p, dict) and p.get("path") and p.get("name")
     ]
+    if migrate_tier:
+        save_config(cfg)
     return cfg
 
 
@@ -1386,6 +1406,13 @@ QFrame#Sidebar { background-color: #ffeef5; border: none; border-right: 1px soli
 QFrame#Card { background-color: #ffffff; border: 1px solid #f6d9e6; border-radius: 12px; }
 QFrame#UserBubble { background-color: #ffdfeb; border: 1px solid #f7c3d8; border-radius: 13px; }
 QFrame#AssistantBubble { background-color: #ffffff; border: 1px solid #f2d6e3; border-radius: 13px; }
+QFrame#MasterBubble { background-color: #f4f8ff; border: 1px solid #c9ddf7; border-radius: 13px; }
+QFrame#WorkerBubble { background-color: #fffdf4; border: 1px solid #f0e0b8; border-radius: 13px; }
+QLabel#MasterRole { color: #3f6b9e; font-size: 11px; font-weight: 600; }
+QLabel#WorkerRole { color: #9a7524; font-size: 11px; font-weight: 600; }
+QFrame#DualPanel { background-color: #ffffff; border: 1px solid #f2d6e3; border-radius: 10px; }
+QLabel#DualBalance { color: #8a6073; font-size: 11px; }
+QLabel#DualShare { color: #c25d84; font-size: 11px; font-weight: 600; }
 QFrame#ToolChip { background-color: #fff2f7; border: 1px solid #f5cfe0; border-radius: 9px; }
 QLabel { background: transparent; }
 QLabel#H1 { font-size: 21px; font-weight: 600; color: #3f2a34; }
@@ -1625,15 +1652,27 @@ class ChatBubble(QFrame):
         self.raw_text = text or ""
         self.base_dir = base_dir or ""
         self._inline_images = []
-        self.setObjectName("UserBubble" if role == "user" else "AssistantBubble")
+        object_name = {
+            "user": "UserBubble",
+            "master": "MasterBubble",
+            "worker": "WorkerBubble",
+        }.get(role, "AssistantBubble")
+        self.setObjectName(object_name)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(13, 9, 13, 11)
         layout.setSpacing(4)
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(6)
-        role_label = QLabel("你" if role == "user" else "Claude")
-        role_label.setObjectName("ChatRole")
+        role_text = {
+            "user": "你",
+            "master": "主 AI · M",
+            "worker": "执行 AI · W",
+        }.get(role, "Claude")
+        role_label = QLabel(role_text)
+        role_label.setObjectName(
+            "MasterRole" if role == "master" else
+            "WorkerRole" if role == "worker" else "ChatRole")
         head.addWidget(role_label)
         head.addStretch(1)
         self.quote_btn = QToolButton()
@@ -1669,7 +1708,8 @@ class ChatBubble(QFrame):
         self._set_body_text(text or "", plain)
         self.setMaximumWidth(780)
         # 给气泡一个最小宽度，避免长句被挤成细长条
-        self.setMinimumWidth(340 if role == "assistant" else 280)
+        self.setMinimumWidth(
+            340 if role in ("assistant", "master", "worker") else 280)
 
     def _set_body_text(self, text, plain):
         self.raw_text = text or ""
@@ -7547,7 +7587,7 @@ class ProgressPopup(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setWindowIcon(make_app_icon())
         self.config = load_config()
         self.current_project = None
@@ -7563,6 +7603,33 @@ class MainWindow(QMainWindow):
         self._effort = self.config.get("effort") or "high"
         if not isinstance(self._effort, str) or not self._effort.strip():
             self._effort = "high"
+        # 双 AI 协作状态：主/从模型、工作档次、余额查询线程
+        self._dual_master = dual_ai.RoleSpec.from_dict(
+            self.config.get("dual_master"), "claude")
+        self._dual_worker = dual_ai.RoleSpec.from_dict(
+            self.config.get("dual_worker"), "codex")
+        # 旧配置只有占比；一次性换算成档次，之后不再按比例调度。
+        tier_value = self.config.get("dual_tier")
+        if not tier_value:
+            tier_value = self.config.get("dual_share", 30)
+        self._dual_tier = dual_ai.normalize_tier(tier_value)
+        if self.config.get("dual_tier") != self._dual_tier:
+            self.config["dual_tier"] = self._dual_tier
+            save_config(self.config)
+        self._balance_workers = []
+        self._balance_cache = {}
+        # 正在查询的余额键 -> 开始时间；用于去重和超时提示，
+        # 避免运行任务时反复点「↻」堆积请求、界面一直停在“查询中…”。
+        self._balance_pending = {}
+        self._balance_timer = QTimer(self)
+        self._balance_timer.setInterval(5 * 60 * 1000)
+        # 定时刷新允许命中 5 分钟缓存；手动「↻」仍强制查询。
+        self._balance_timer.timeout.connect(
+            lambda: self._refresh_balances(force=False))
+        self._balance_watch = QTimer(self)
+        self._balance_watch.setInterval(1000)
+        self._balance_watch.timeout.connect(self._check_balance_timeouts)
+        self._balance_watch.start()
         # 从服务商自动获取的模型目录：{模型 ID: {name, efforts, ...}}
         self._model_catalog = {m["id"]: dict(m) for m in FALLBACK_MODELS}
         self._catalog_thread = None
@@ -7582,6 +7649,16 @@ class MainWindow(QMainWindow):
         self._stream_dirty = False
         self._closing = False
         self._chat_empty = None
+        # 切换项目后的定位：渲染代次隔离过期滚动回调；批量重建期间
+        # 抑制逐项滚到底，等布局稳定后把最近一轮用户提问顶到视口顶部。
+        self._chat_render_gen = 0
+        self._chat_bulk_render = False
+        self._chat_last_wrapper = None
+        self._chat_last_user_wrapper = None
+        # 显式滚到底的序号：用于判断切换定位是否已被新的聊天滚动取代。
+        self._chat_scroll_seq = 0
+        # 对话页不在前台时暂存定位，切回对话页再应用。
+        self._pending_chat_anchor = None
         self._plugin_worker = None
         self._skill_worker = None
         self._plugins_loaded = False
@@ -7618,6 +7695,10 @@ class MainWindow(QMainWindow):
         self._stream_timer = QTimer(self)
         self._stream_timer.setInterval(60)
         self._stream_timer.timeout.connect(self._flush_stream)
+        # 双 AI 流式输出按 80ms 合并刷新，避免每个 token 都重排气泡导致界面卡顿。
+        self._dual_stream_timer = QTimer(self)
+        self._dual_stream_timer.setInterval(80)
+        self._dual_stream_timer.timeout.connect(self._flush_dual_stream)
         self._chat_qa_timer = QTimer(self)
         self._chat_qa_timer.setInterval(80)
         self._chat_qa_timer.timeout.connect(self._flush_chat_qa_live)
@@ -7955,8 +8036,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(10)
 
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
+        self.chat_toolbar = QWidget()
+        bar = QHBoxLayout(self.chat_toolbar)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(6)
         perm_label = QLabel("权限")
         perm_label.setObjectName("Muted")
         bar.addWidget(perm_label)
@@ -7979,34 +8062,6 @@ class MainWindow(QMainWindow):
             "帮我批准：自动接受文件编辑\n"
             "完全访问：跳过所有权限确认")
         bar.addWidget(self.perm_combo)
-
-        model_label = QLabel("模型")
-        model_label.setObjectName("Muted")
-        bar.addWidget(model_label)
-        self.model_combo = QComboBox()
-        self.model_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.model_combo.setMinimumWidth(190)
-        self.model_combo.setToolTip(
-            "模型列表从当前服务商自动获取（cc-switch 的 settings.json）。\n"
-            "切换后会重建会话，并保留当前对话的上下文。")
-        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
-        bar.addWidget(self.model_combo)
-
-        self.btn_refresh_models = QToolButton()
-        self.btn_refresh_models.setText("↻")
-        self.btn_refresh_models.setObjectName("Small")
-        self.btn_refresh_models.setToolTip("重新从服务商获取模型列表")
-        self.btn_refresh_models.clicked.connect(self._refresh_model_catalog)
-        bar.addWidget(self.btn_refresh_models)
-
-        effort_label = QLabel("思考")
-        effort_label.setObjectName("Muted")
-        bar.addWidget(effort_label)
-        self.effort_combo = QComboBox()
-        self.effort_combo.setMinimumWidth(80)
-        self.effort_combo.setToolTip("思考档位，随所选模型支持的档位变化")
-        self.effort_combo.currentIndexChanged.connect(self._on_effort_changed)
-        bar.addWidget(self.effort_combo)
 
         self.btn_new_chat = QPushButton("新对话")
         self.btn_new_chat.setObjectName("Primary")
@@ -8052,8 +8107,19 @@ class MainWindow(QMainWindow):
         self.chat_status = QLabel("就绪")
         self.chat_status.setObjectName("Muted")
         bar.addWidget(self.chat_status)
-        layout.addLayout(bar)
-        self._populate_model_combo()
+        # 窄窗口横向滚动整条工具栏，不折行或挤压模型控件。
+        self.chat_toolbar_scroll = QScrollArea()
+        self.chat_toolbar_scroll.setFrameShape(QFrame.NoFrame)
+        self.chat_toolbar_scroll.setWidgetResizable(True)
+        self.chat_toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.chat_toolbar_scroll.setWidget(self.chat_toolbar)
+        self.chat_toolbar_scroll.setFixedHeight(
+            bar.sizeHint().height()
+            + self.chat_toolbar_scroll.horizontalScrollBar().sizeHint().height() + 4)
+        layout.addWidget(self.chat_toolbar_scroll)
+        QTimer.singleShot(1200, self._refresh_balances)
+        self._balance_timer.start()
 
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setObjectName("ChatScroll")
@@ -8109,22 +8175,76 @@ class MainWindow(QMainWindow):
         self.chat_input.image_pasted.connect(self._add_pasted_image)
         layout.addWidget(self.chat_input)
 
+        # 模型配置默认收起：底栏「模型配置」按钮控制显隐。
+        # 控件只创建一次，展开 / 收起不会重建控件或重置选择。
+        self.model_config_panel = QWidget()
+        config_row = QHBoxLayout(self.model_config_panel)
+        config_row.setContentsMargins(0, 0, 0, 0)
+        config_row.setSpacing(6)
+
+        self.single_model_panel = QWidget()
+        single = QHBoxLayout(self.single_model_panel)
+        single.setContentsMargins(0, 0, 0, 0)
+        single.setSpacing(6)
+        model_label = QLabel("模型")
+        model_label.setObjectName("Muted")
+        single.addWidget(model_label)
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(190)
+        self.model_combo.setToolTip(
+            "模型列表从当前服务商自动获取（cc-switch 的 settings.json）。\n"
+            "切换后会重建会话，并保留当前对话的上下文。")
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        single.addWidget(self.model_combo)
+        effort_label = QLabel("思考")
+        effort_label.setObjectName("Muted")
+        single.addWidget(effort_label)
+        self.effort_combo = QComboBox()
+        self.effort_combo.setMinimumWidth(80)
+        self.effort_combo.setToolTip("思考档位，随所选模型支持的档位变化")
+        self.effort_combo.currentIndexChanged.connect(self._on_effort_changed)
+        single.addWidget(self.effort_combo)
+        config_row.addWidget(self.single_model_panel)
+        self._build_dual_panel(config_row)
+
+        self.btn_refresh_models = QToolButton()
+        self.btn_refresh_models.setText("↻")
+        self.btn_refresh_models.setObjectName("Small")
+        self.btn_refresh_models.setToolTip("重新获取服务商和 Codex 模型及思考档位")
+        self.btn_refresh_models.clicked.connect(self._refresh_model_catalog)
+        config_row.addWidget(self.btn_refresh_models)
+        config_row.addStretch(1)
+
+        # 窄窗口横向滚动配置行，保证主 / 从等长配置仍可访问。
+        self.model_config_scroll = QScrollArea()
+        self.model_config_scroll.setFrameShape(QFrame.NoFrame)
+        self.model_config_scroll.setWidgetResizable(True)
+        self.model_config_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.model_config_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.model_config_scroll.setWidget(self.model_config_panel)
+        self.model_config_scroll.setFixedHeight(
+            config_row.sizeHint().height()
+            + self.model_config_scroll.horizontalScrollBar().sizeHint().height() + 20)
+        self.model_config_scroll.setVisible(False)
+        layout.addWidget(self.model_config_scroll)
+        self._populate_model_combo()
+        self._populate_dual_combos()
+
         bottom = QHBoxLayout()
-        hint = QLabel(
-            "Enter 发送 · Shift+Enter 换行 · 粘贴图片自动识别 · "
-            "选中消息文字可右键提问 · Esc 停止")
-        hint.setObjectName("Muted")
-        bottom.addWidget(hint)
+        bottom.setSpacing(6)
+        # 快捷键提示已写在输入框占位文字里；这里把空间留给余额 / 额度，
+        # 保证底栏在 960 宽窗口下也能完整显示。
         self.btn_chat_qa = QPushButton("问答窗口")
         self.btn_chat_qa.setObjectName("Flat")
         self.btn_chat_qa.setToolTip(
             "直接打开对话问答窗口，不需要先选中内容（Ctrl+Shift+W 可随时召回）")
         self.btn_chat_qa.clicked.connect(self._show_chat_qa_window)
         bottom.addWidget(self.btn_chat_qa)
-        self.btn_ask_selection = QPushButton("针对选中内容提问")
+        self.btn_ask_selection = QPushButton("选中提问")
         self.btn_ask_selection.setObjectName("Flat")
         self.btn_ask_selection.setToolTip(
-            "先在对话气泡里选中一段内容，再点这里打开悬浮问答窗（Ctrl+Shift+W 召回）")
+            "先在对话气泡里选中一段内容，再点这里打开悬浮问答窗"
+            "（Ctrl+Shift+W 召回）")
         self.btn_ask_selection.clicked.connect(self._ask_chat_selection)
         bottom.addWidget(self.btn_ask_selection)
         self.btn_progress = QPushButton("进度查询")
@@ -8134,6 +8254,23 @@ class MainWindow(QMainWindow):
         self.btn_progress.clicked.connect(self._show_progress_popup)
         bottom.addWidget(self.btn_progress)
         bottom.addStretch(1)
+        # 底栏顺序：双 AI 协作开关 → 模型配置按钮 → 额度显示 → 停止 → 发送。
+        self.dual_check = QCheckBox("双 AI 协作")
+        self.dual_check.setToolTip(
+            "主 AI 负责规划、疑难处理和验收，执行 AI 负责范围内实现。\n"
+            "主 AI 占比 0 / 100 时仅调用一个角色。")
+        self.dual_check.setChecked(bool(self.config.get("dual_mode")))
+        self.dual_check.toggled.connect(self._on_dual_toggled)
+        bottom.addWidget(self.dual_check)
+        self.btn_model_config = QPushButton("模型配置 ▾")
+        self.btn_model_config.setObjectName("Flat")
+        self.btn_model_config.setCheckable(True)
+        self.btn_model_config.setToolTip(
+            "展开 / 收起模型、思考档位、协作档次、交换主从和模型目录刷新")
+        self.btn_model_config.toggled.connect(self._toggle_model_config)
+        bottom.addWidget(self.btn_model_config)
+        # 余额 / 额度紧贴停止按钮左侧：协作模式显示主从，单模型显示当前模型。
+        bottom.addWidget(self.dual_balance_panel)
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setObjectName("Danger")
         self.btn_stop.setEnabled(False)
@@ -8145,6 +8282,8 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.btn_send)
         layout.addLayout(bottom)
 
+        # 底栏控件创建完毕后再同步一次模式 / 忙碌状态。
+        self._update_dual_controls()
         self._build_chat_qa_window()
         self._update_chat_qa_buttons()
         self._show_empty_state("开始新的对话吧\n在下方输入消息")
@@ -8345,6 +8484,9 @@ class MainWindow(QMainWindow):
             self._stabilize_page_layout(widget)
             QTimer.singleShot(
                 0, lambda w=widget: self._stabilize_page_layout(w))
+        if widget is getattr(self, "chat_tab", None):
+            # 切回对话页时补上切换项目时因页面隐藏而暂存的定位。
+            QTimer.singleShot(0, self._apply_pending_chat_anchor)
         if widget is self.assets_tab:
             self._refresh_skills()
             if not self._plugins_loaded:
@@ -9300,6 +9442,796 @@ class MainWindow(QMainWindow):
         worker.start()
         return worker
 
+    # ------------------------------------------------------ 双 AI 协作面板 --
+    def _build_dual_panel(self, layout):
+        # 与单模型组共用原模型位置；整个组隐藏后标签也不占空间。
+        self.dual_panel = QWidget()
+        row = QHBoxLayout(self.dual_panel)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.dual_tier_label = QLabel("档次")
+        self.dual_tier_label.setObjectName("Muted")
+        self.dual_tier_combo = QComboBox()
+        self.dual_tier_combo.setFixedWidth(150)
+        self.dual_tier_combo.setToolTip(
+            "按工作部件难度分工，而不是按比例：\n"
+            + "\n".join(f"{p.id} {p.label}：{p.summary}" for p in dual_ai.tier_choices()))
+        for policy in dual_ai.tier_choices():
+            self.dual_tier_combo.addItem(policy.label, policy.id)
+        index = self.dual_tier_combo.findData(self._dual_tier)
+        self.dual_tier_combo.setCurrentIndex(index if index >= 0 else
+                                             self.dual_tier_combo.findData(dual_ai.L2))
+        self.dual_tier_combo.currentIndexChanged.connect(
+            self._on_dual_tier_changed)
+
+        for role, label, handler in (
+                ("master", "主 AI", self._on_dual_master_changed),
+                ("worker", "执行 AI", self._on_dual_worker_changed)):
+            if role == "worker":
+                row.addWidget(self.dual_tier_label)
+                row.addWidget(self.dual_tier_combo)
+                self.dual_swap_btn = QToolButton()
+                self.dual_swap_btn.setText("⇄")
+                self.dual_swap_btn.setObjectName("Small")
+                self.dual_swap_btn.setToolTip("交换两个角色的模型及思考档位")
+                self.dual_swap_btn.clicked.connect(self._swap_dual_roles)
+                row.addWidget(self.dual_swap_btn)
+                # 复查开关紧跟协作档次：简单任务可取消主 AI 独立复查省额度。
+                self.review_check = QCheckBox("复查")
+                self.review_check.setToolTip(
+                    "勾选（默认）：按协作档次执行复查策略；L1/L2 完成后验收，"
+                    "L3 失败时审查，L0/L4 无独立复查。\n"
+                    "取消：跳过独立复查以节省额度；执行者自检、失败接管和"
+                    "任务结果判定不受影响。")
+                self.review_check.setChecked(
+                    bool(self.config.get("dual_review_enabled", True)))
+                self.review_check.toggled.connect(self._on_dual_review_toggled)
+                row.addWidget(self.review_check)
+            title = QLabel(label)
+            title.setObjectName("Muted")
+            row.addWidget(title)
+            combo = QComboBox()
+            combo.setFixedWidth(165)
+            combo.setToolTip(label + "模型：支持 Claude 服务商与 Codex 登录模型")
+            combo.currentIndexChanged.connect(handler)
+            setattr(self, "dual_" + role + "_combo", combo)
+            row.addWidget(combo)
+            title = QLabel("思考")
+            title.setObjectName("Muted")
+            row.addWidget(title)
+            effort = QComboBox()
+            # 覆盖全局下拉框最小宽度，保证短档位控件保持紧凑。
+            effort.setStyleSheet("QComboBox { min-width: 72px; max-width: 72px; }")
+            effort.currentIndexChanged.connect(
+                lambda _index, r=role: self._on_dual_effort_changed(r))
+            setattr(self, "dual_" + role + "_effort_combo", effort)
+            row.addWidget(effort)
+
+        layout.addWidget(self.dual_panel)
+
+        # 余额容器放在输入框下方、停止按钮左侧。
+        # 协作模式显示主 / 从两个额度，单模型模式只显示当前模型余额。
+        self.dual_balance_panel = QWidget()
+        balances = QHBoxLayout(self.dual_balance_panel)
+        balances.setContentsMargins(0, 0, 0, 0)
+        balances.setSpacing(6)
+        self.dual_master_balance = QLabel("主：额度 —")
+        self.dual_master_balance.setObjectName("DualBalance")
+        balances.addWidget(self.dual_master_balance)
+        self.dual_worker_balance = QLabel("从：额度 —")
+        self.dual_worker_balance.setObjectName("DualBalance")
+        balances.addWidget(self.dual_worker_balance)
+        self.single_balance = QLabel("余额 —")
+        self.single_balance.setObjectName("DualBalance")
+        balances.addWidget(self.single_balance)
+        self.dual_balance_btn = QToolButton()
+        self.dual_balance_btn.setText("↻")
+        self.dual_balance_btn.setObjectName("Small")
+        self.dual_balance_btn.setToolTip("刷新当前模式的余额 / 额度")
+        self.dual_balance_btn.clicked.connect(self._refresh_balances)
+        balances.addWidget(self.dual_balance_btn)
+
+        self._update_dual_controls()
+
+    def _fill_dual_combo(self, combo, current, default_source="claude"):
+        combo.blockSignals(True)
+        combo.clear()
+        claude_models = list(self._model_catalog.values())
+        if not claude_models:
+            claude_models = [dict(item) for item in FALLBACK_MODELS]
+        codex_models = dual_ai.load_codex_models()
+
+        def header(text):
+            combo.addItem(text, None)
+            item = combo.model().item(combo.count() - 1)
+            if item is not None:
+                item.setEnabled(False)
+
+        header("── Claude 服务商 ──")
+        for meta in claude_models:
+            model_id = str(meta.get("id") or "")
+            name = str(meta.get("name") or model_id)
+            combo.addItem(name, {"source": "claude", "model": model_id,
+                                 "name": name,
+                                 "efforts": meta.get("efforts", FALLBACK_EFFORTS),
+                                 "efforts_known": "efforts" in meta,
+                                 "default_effort": meta.get("default_effort")})
+        header("── Codex 登录模型 ──")
+        for meta in codex_models:
+            model_id = str(meta.get("id") or "")
+            name = "Codex · " + str(meta.get("name") or model_id)
+            combo.addItem(name, {"source": "codex", "model": model_id,
+                                 "name": name, "efforts": meta.get("efforts") or [],
+                                 "default_effort": meta.get("default_effort")})
+
+        target_source = current.source if isinstance(
+            current, dual_ai.RoleSpec) else "claude"
+        target_model = current.model if isinstance(
+            current, dual_ai.RoleSpec) else ""
+        # 服务商目录异步加载：保存的自定义模型不能先被内置兜底覆盖。
+        if target_model and not any(
+                isinstance(combo.itemData(i), dict)
+                and (combo.itemData(i).get("source"),
+                     combo.itemData(i).get("model")) == (target_source, target_model)
+                for i in range(combo.count())):
+            combo.addItem(current.label or target_model,
+                          {"source": target_source, "model": target_model,
+                           "name": current.label, "efforts": [],
+                           "efforts_known": False})
+        selected = -1
+        for index in range(combo.count()):
+            data = combo.itemData(index)
+            if (isinstance(data, dict)
+                    and data.get("source") == target_source
+                    and data.get("model") == target_model):
+                selected = index
+                break
+        if selected < 0:
+            # 已保存过来源时尊重它；只有从未选择过才用默认来源。
+            # 默认：主 AI 跟随当前 Claude 模型，执行 AI 用 Codex 登录模型。
+            source = target_source if target_source in (
+                "claude", "codex") else default_source
+            if source == "codex":
+                fallback = dual_ai.default_codex_model()
+                wanted = ("codex", fallback["id"] if fallback else "")
+            else:
+                wanted = ("claude", target_model or self._model)
+            for index in range(combo.count()):
+                data = combo.itemData(index)
+                if (isinstance(data, dict)
+                        and (data.get("source"), data.get("model")) == wanted):
+                    selected = index
+                    break
+        if selected < 0:
+            for index in range(combo.count()):
+                if isinstance(combo.itemData(index), dict):
+                    selected = index
+                    break
+        combo.setCurrentIndex(max(0, selected))
+        combo.blockSignals(False)
+
+    def _populate_dual_combos(self):
+        if not hasattr(self, "dual_master_combo"):
+            return
+        changed = False
+        for role, source in (("master", "claude"), ("worker", "codex")):
+            current = getattr(self, "_dual_" + role)
+            # 旧配置首次迁移时，主模型跟随单模型（包括尚未加载的自定义模型）。
+            current = dual_ai.RoleSpec(
+                source=current.source,
+                model=current.model or (self._model if current.source == "claude" else ""),
+                name=current.name,
+                effort=self._effort if current.effort is None else current.effort)
+            combo = getattr(self, "dual_" + role + "_combo")
+            self._fill_dual_combo(combo, current, default_source=source)
+            self._populate_dual_effort(role, current.effort)
+            spec = self._dual_spec_from_combo(role)
+            if (not self._catalog_loaded and spec.source == "claude"
+                    and spec.model == current.model and current.effort is not None
+                    and not (combo.currentData() or {}).get("efforts_known")):
+                # 显示临时支持的选项，但保留持久化偏好供目录到达后恢复。
+                spec.effort = current.effort
+            setattr(self, "_dual_" + role, spec)
+            key = "dual_" + role
+            if self.config.get(key) != spec.to_dict():
+                self.config[key] = spec.to_dict()
+                changed = True
+        if changed:
+            save_config(self.config)
+        self._update_dual_controls()
+
+    @staticmethod
+    def _combo_spec(combo):
+        data = combo.currentData()
+        if not isinstance(data, dict):
+            return dual_ai.RoleSpec()
+        return dual_ai.RoleSpec(
+            source=str(data.get("source") or "claude"),
+            model=str(data.get("model") or ""),
+            name=str(data.get("name") or ""),
+            efforts=tuple(data.get("efforts") or ()))
+
+    def _populate_dual_effort(self, role, preferred=None):
+        model_combo = getattr(self, "dual_" + role + "_combo")
+        combo = getattr(self, "dual_" + role + "_effort_combo")
+        spec = self._combo_spec(model_combo)
+        levels = dual_ai.supported_efforts(spec)
+        model_combo.setToolTip(f"{spec.label}\n后端：{spec.source}\n模型：{spec.model}")
+        data = model_combo.currentData() or {}
+        # 老配置只迁移一次全局档位，此后两个角色完全独立。
+        wanted = self._effort if preferred is None else preferred
+        if wanted not in levels:
+            wanted = data.get("default_effort")
+        if wanted not in levels:
+            wanted = "high" if "high" in levels else (levels[0] if levels else "")
+        combo.blockSignals(True)
+        combo.clear()
+        for level in levels:
+            combo.addItem(level, level)
+        if not levels:
+            combo.addItem("默认", "")
+        combo.setCurrentIndex(max(0, combo.findData(wanted)))
+        combo.blockSignals(False)
+        combo.setToolTip("该模型支持：" + " / ".join(levels) if levels
+                         else "该模型未报告可选思考档位，使用模型默认值")
+
+    def _on_dual_effort_changed(self, role):
+        spec = self._dual_spec_from_combo(role)
+        setattr(self, "_dual_" + role, spec)
+        self.config["dual_" + role] = spec.to_dict()
+        save_config(self.config)
+
+    def _set_combo_to_spec(self, combo, spec):
+        combo.blockSignals(True)
+        for index in range(combo.count()):
+            data = combo.itemData(index)
+            if (isinstance(data, dict) and spec is not None
+                    and data.get("source") == spec.source
+                    and data.get("model") == spec.model):
+                combo.setCurrentIndex(index)
+                break
+        combo.blockSignals(False)
+
+    def _on_dual_toggled(self, checked):
+        self.config["dual_mode"] = bool(checked)
+        save_config(self.config)
+        self._update_chat_buttons()
+        # 切换模式后按新模式刷新底栏额度；5 分钟内的缓存可直接复用，
+        # 过期结果会在 _refresh_balance 中重新查询。
+        self._refresh_balances(force=False)
+        if checked:
+            policy = dual_ai.tier_policy(self._dual_tier)
+            self.statusBar().showMessage(
+                f"双 AI 协作已开启（档次 {policy.label}）："
+                "按工作部件难度分工，压缩跨模型交接，节省额度", 5000)
+        else:
+            self.statusBar().showMessage("已切回单模型对话", 3000)
+
+    def _on_dual_master_changed(self, _index):
+        self._populate_dual_effort("master", self._dual_master.effort)
+        spec = self._dual_spec_from_combo("master")
+        if not spec.model:
+            return
+        self._dual_master = spec
+        self.config["dual_master"] = spec.to_dict()
+        save_config(self.config)
+        self._update_dual_controls()
+        self._refresh_balance("master", force=True)
+        self.statusBar().showMessage(f"主 AI：{spec.label}", 2500)
+
+    def _on_dual_worker_changed(self, _index):
+        self._populate_dual_effort("worker", self._dual_worker.effort)
+        spec = self._dual_spec_from_combo("worker")
+        if not spec.model:
+            return
+        self._dual_worker = spec
+        self.config["dual_worker"] = spec.to_dict()
+        save_config(self.config)
+        self._update_dual_controls()
+        self._refresh_balance("worker", force=True)
+        self.statusBar().showMessage(f"执行 AI：{spec.label}", 2500)
+
+    def _swap_dual_roles(self):
+        master = self._dual_spec_from_combo("master")
+        worker = self._dual_spec_from_combo("worker")
+        self._set_combo_to_spec(self.dual_master_combo, worker)
+        self._set_combo_to_spec(self.dual_worker_combo, master)
+        self._populate_dual_effort("master", worker.effort)
+        self._populate_dual_effort("worker", master.effort)
+        self._dual_master = self._dual_spec_from_combo("master")
+        self._dual_worker = self._dual_spec_from_combo("worker")
+        self.config["dual_master"] = self._dual_master.to_dict()
+        self.config["dual_worker"] = self._dual_worker.to_dict()
+        save_config(self.config)
+        self._update_dual_controls()
+        self._refresh_balances()
+        self.statusBar().showMessage(
+            f"已交换：主 AI = {self._dual_master.label}，"
+            f"执行 AI = {self._dual_worker.label}", 3500)
+
+    def _on_dual_review_toggled(self, checked):
+        self.config["dual_review_enabled"] = bool(checked)
+        save_config(self.config)
+        self.statusBar().showMessage(
+            "主 AI 复查已开启：按当前协作档次执行验收策略"
+            if checked else
+            "已关闭主 AI 复查：跳过独立验收调用；执行者自检与失败接管保留",
+            4000)
+
+    def _on_dual_tier_changed(self, _index):
+        tier = self.dual_tier_combo.currentData() or dual_ai.L2
+        self._dual_tier = dual_ai.normalize_tier(tier)
+        self.config["dual_tier"] = self._dual_tier
+        save_config(self.config)
+        policy = dual_ai.tier_policy(self._dual_tier)
+        self._update_dual_controls()
+        self.statusBar().showMessage(
+            f"协作档次：{policy.label} — {policy.short}", 3500)
+
+    def _toggle_model_config(self, checked):
+        """展开 / 收起模型配置；只切换显隐，不重建控件、不重置选择。"""
+        self.model_config_scroll.setVisible(bool(checked))
+        self.btn_model_config.setText(
+            "模型配置 ▴" if checked else "模型配置 ▾")
+
+    def _update_dual_controls(self):
+        if not hasattr(self, "dual_check"):
+            return
+        on = self.dual_check.isChecked()
+        self.single_model_panel.setVisible(not on)
+        self.dual_panel.setVisible(on)
+        busy = bool(self._chat_busy)
+        self.dual_check.setEnabled(not busy)
+        for widget in (self.dual_master_combo, self.dual_worker_combo,
+                       self.dual_swap_btn, self.dual_tier_combo,
+                       self.review_check):
+            widget.setEnabled(on and not busy)
+        for role in ("master", "worker"):
+            combo = getattr(self, "dual_" + role + "_effort_combo")
+            combo.setEnabled(on and not busy and bool(combo.currentData()))
+        if hasattr(self, "btn_refresh_models"):
+            self.btn_refresh_models.setEnabled(not busy and self._catalog_thread is None)
+        # 余额查询在后台线程进行，运行任务时也应可随时刷新查看。
+        self.dual_balance_btn.setEnabled(True)
+        # 底栏余额标签随模式切换：协作看主从，单模型看当前模型。
+        if hasattr(self, "single_balance"):
+            self.single_balance.setVisible(not on)
+            self.dual_balance_btn.setToolTip(
+                "刷新两个模型的余额 / 额度" if on
+                else "刷新当前模型的余额 / 额度")
+        self.dual_master_balance.setVisible(on)
+        self.dual_worker_balance.setVisible(on)
+        # 双 AI 模式下，顶部单模型选择让位给主 / 从两个下拉框
+        if hasattr(self, "model_combo") and hasattr(self, "effort_combo"):
+            self.model_combo.setEnabled(not busy and not on)
+            self.effort_combo.setEnabled(not busy and not on)
+
+    def _dual_spec_from_combo(self, role):
+        spec = self._combo_spec(getattr(self, "dual_" + role + "_combo"))
+        spec.effort = getattr(self, "dual_" + role + "_effort_combo").currentData() or ""
+        return spec
+
+    def _dual_mode_on(self):
+        return bool(getattr(self, "dual_check", None)
+                    and self.dual_check.isChecked())
+
+    def _balance_spec(self, role):
+        """取某余额角色当前对应的模型；single 用单模型下拉框。"""
+        if role == "single":
+            model = self.model_combo.currentData() or self._model
+            if not model:
+                return dual_ai.RoleSpec(source="claude")
+            return dual_ai.RoleSpec(
+                source="claude", model=str(model),
+                name=self.model_combo.currentText() or str(model),
+                effort=self._current_effort())
+        return self._dual_spec_from_combo(role)
+
+    def _balance_label(self, role):
+        if role == "master":
+            return self.dual_master_balance
+        if role == "worker":
+            return self.dual_worker_balance
+        return self.single_balance
+
+    def _refresh_balances(self, _checked=False, force=True):
+        if not hasattr(self, "single_balance"):
+            return
+        if self._dual_mode_on():
+            self._refresh_balance("master", force=force)
+            self._refresh_balance("worker", force=force)
+        else:
+            self._refresh_balance("single", force=force)
+
+    # 余额查询的最长等待时间；超时后释放标签，避免一直卡在“查询中…”。
+    BALANCE_TIMEOUT = 25
+
+    def _refresh_balance(self, role, force=False):
+        if not hasattr(self, "single_balance"):
+            return
+        spec = self._balance_spec(role)
+        if not spec.model:
+            return
+        label = self._balance_label(role)
+        prefix = {"master": "主", "worker": "从"}.get(role, "")
+        key = (spec.source, spec.model)
+        cached = self._balance_cache.get(key)
+        if not force and cached and time.monotonic() - cached[0] < 300:
+            self._apply_balance(role, label, prefix, cached[1])
+            return
+        # 自动刷新不重复发起同一模型的查询；手动「↻」仍允许主动重试。
+        if not force and key in self._balance_pending:
+            return
+        self._balance_pending[key] = time.monotonic()
+        label.setText(f"{prefix} 查询中…" if prefix else "查询中…")
+        label.setStyleSheet("")
+        worker = dual_ai.BalanceWorker(role, spec, provider_env(), self)
+        worker.ready.connect(
+            lambda role, result, selected=spec: self._on_balance_ready(role, result, selected))
+        worker.done.connect(
+            lambda w=worker: self._cleanup_balance_worker(w))
+        self._balance_workers.append(worker)
+        worker.start()
+
+    def _check_balance_timeouts(self):
+        """查询长时间未返回时恢复标签，用户可立即重试。"""
+        if not self._balance_pending:
+            return
+        now = time.monotonic()
+        for key, since in list(self._balance_pending.items()):
+            if now - since < self.BALANCE_TIMEOUT:
+                continue
+            self._balance_pending.pop(key, None)
+            for role in ("single", "master", "worker"):
+                if not hasattr(self, "single_balance"):
+                    continue
+                spec = self._balance_spec(role)
+                if (spec.source, spec.model) != key:
+                    continue
+                label = self._balance_label(role)
+                if "查询中" not in label.text():
+                    continue
+                prefix = {"master": "主", "worker": "从"}.get(role, "")
+                label.setText(
+                    f"{prefix} 查询超时 · 点 ↻ 重试" if prefix
+                    else "查询超时 · 点 ↻ 重试")
+                label.setToolTip(
+                    f"余额 / 额度查询超过 {self.BALANCE_TIMEOUT} 秒未返回，"
+                    "可稍后点击 ↻ 重试")
+                label.setStyleSheet("color:#b05a5a;")
+
+    def _cleanup_balance_worker(self, worker):
+        if worker in self._balance_workers:
+            self._balance_workers.remove(worker)
+        worker.deleteLater()
+
+    def _on_balance_ready(self, role, result, queried_spec=None):
+        label = self._balance_label(role)
+        prefix = {"master": "主", "worker": "从"}.get(role, "")
+        spec = self._balance_spec(role)
+        key = (spec.source, spec.model)
+        queried_key = ((queried_spec.source, queried_spec.model)
+                       if queried_spec is not None else key)
+        self._balance_cache[queried_key] = (time.monotonic(), result)
+        self._balance_pending.pop(queried_key, None)
+        # 只应用仍对应当前所选模型的结果，避免旧查询覆盖新额度。
+        if queried_key == key:
+            self._apply_balance(role, label, prefix, result)
+
+    @staticmethod
+    def _apply_balance(role, label, prefix, result):
+        text = str((result or {}).get("text") or "—").strip()
+        if role == "master":
+            # 底栏空间有限：去掉冗余的「余额」并只保留「主」前缀。
+            text = text.removeprefix("余额 ").strip()
+            text = f"{prefix} {text}"
+        elif role == "worker":
+            # 「Plus · 5h 6% · 周 1%」压缩后仍保留全部用量数字。
+            text = text.replace(" · ", " ")
+            text = re.sub(r"\s+(?=\d+%)", "", text)
+            text = f"{prefix} {text}"
+        label.setText(text)
+        label.setToolTip(str((result or {}).get("detail") or ""))
+        if not (result or {}).get("ok"):
+            label.setStyleSheet("color:#b05a5a;")
+        else:
+            label.setStyleSheet("")
+
+    def _send_dual_message(self, prompt, display):
+        state = self._chat_state()
+        thread = state.get("dual_thread")
+        if thread is not None and thread.isRunning():
+            self.statusBar().showMessage("协作任务正在运行，请先停止或等待完成", 3000)
+            return
+        master = self._dual_spec_from_combo("master")
+        worker = self._dual_spec_from_combo("worker")
+        tier = self.dual_tier_combo.currentData() or self._dual_tier
+        policy = dual_ai.tier_policy(tier)
+        active_specs = ([master] if policy.solo_role == dual_ai.MASTER
+                        else [worker] if policy.solo_role == dual_ai.WORKER
+                        else [master, worker])
+        if any(not spec.model for spec in active_specs):
+            QMessageBox.warning(self, "双 AI 协作",
+                                "请先选择主 AI 和执行 AI 的模型。")
+            return
+        codex_bin = dual_ai.find_codex_binary()
+        claude_bin = find_claude() or ""
+        if not claude_bin and any(spec.source == "claude" for spec in active_specs):
+            QMessageBox.warning(
+                self, "双 AI 协作",
+                "找不到 claude 命令，无法调用 Claude 服务商模型。")
+            return
+        if not codex_bin and any(spec.source == "codex" for spec in active_specs):
+            QMessageBox.warning(
+                self, "双 AI 协作",
+                "找不到 Codex 命令行，无法调用 Codex 登录模型。\n\n"
+                "请确认 ChatGPT/Codex 桌面端已安装并完成登录。")
+            return
+        self._append_chat_block(
+            {"kind": "user", "text": display, "plain": True})
+        self.chat_input.clear()
+        self._clear_attachments()
+        self._reset_live_stream()
+        self._dual_master, self._dual_worker = master, worker
+        self._dual_tier = dual_ai.normalize_tier(tier)
+        thread = dual_ai.DualRunThread(
+            parent=self,
+            cwd=self.current_project,
+            request=prompt,
+            # 当前请求另行发送；历史完整落盘，由角色首次接手读取，不重复塞入每个任务。
+            context=dual_ai.history_context((state.get("blocks") or [])[:-1], limit=None),
+            master=master,
+            worker=worker,
+            tier=self._dual_tier,
+            permission_mode=self._current_permission_mode(),
+            claude_path=claude_bin,
+            codex_path=codex_bin,
+            claude_env=provider_env(),
+            previous_state=state.get("dual_state_dir", ""),
+            # 发送时快照：运行中即使改动勾选也不影响本轮。
+            review_enabled=self.review_check.isChecked(),
+        )
+        state["dual_thread"] = thread
+        state["dual_live"] = ""
+        state["dual_live_bubble"] = None
+        state["dual_live_wrapper"] = None
+        state["dual_last_role"] = ""
+        if (self._current_permission_mode() == "default"
+                and not state.get("dual_perm_noted")):
+            state["dual_perm_noted"] = True
+            self._on_dual_note(
+                state,
+                "提示：双 AI 协作使用命令行无交互模式，"
+                "「请求批准」会按“自动批准文件编辑”执行；"
+                "需要完全放开时请选择「完全访问」。")
+        thread.status.connect(
+            lambda text, s=state: self._on_dual_status(s, text))
+        thread.note.connect(
+            lambda text, s=state: self._on_dual_note(s, text))
+        thread.plan_ready.connect(
+            lambda plan, s=state: self._on_dual_plan(s, plan))
+        thread.role_started.connect(
+            lambda role, label, s=state:
+            self._on_dual_role_started(s, role, label))
+        thread.delta.connect(
+            lambda role, chunk, s=state:
+            self._on_dual_delta(s, role, chunk))
+        thread.message.connect(
+            lambda role, text, tools, s=state:
+            self._on_dual_message(s, role, text, tools))
+        thread.tool.connect(
+            lambda role, name, data, s=state:
+            self._on_dual_tool(s, role, name, data))
+        thread.completed.connect(
+            lambda info, s=state: self._on_dual_completed(s, info))
+        thread.failed.connect(
+            lambda message, s=state: self._on_dual_failed(s, message))
+        thread.finished.connect(
+            lambda s=state: self._on_dual_thread_finished(s))
+        self._set_dual_busy(True)
+        self.chat_status.setText("双 AI 协作中…")
+        thread.start()
+
+    def _set_dual_busy(self, busy):
+        self._chat_busy = bool(busy)
+        self._update_chat_buttons()
+        if not busy:
+            self._update_dual_controls()
+
+    def _on_dual_status(self, state, text):
+        state["status"] = text
+        if self._is_active_chat_state(state):
+            self.chat_status.setText(text)
+
+    def _on_dual_note(self, state, text):
+        state["blocks"].append({"kind": "note", "text": text})
+        if self._is_active_chat_state(state):
+            self._render_chat_note(text)
+
+    def _on_dual_plan(self, state, plan):
+        tasks = plan.get("tasks") or []
+        tier_label = plan.get("tier_label") or self._dual_tier
+        lines = [f"主 AI 计划（档次 {plan.get('tier')} · {tier_label}）："
+                 f"{plan.get('summary') or '（无摘要）'}"]
+        for task in tasks:
+            role = "主 AI" if task.get("role") == "master" else "执行 AI"
+            ops = "/".join(dual_ai.WORK_OPS.get(x, x) for x in task.get("ops") or [])
+            lines.append(
+                f"  {task.get('id')} · {role} · {task.get('points')} 点"
+                + (f" · {ops}" if ops else "")
+                + f" · {task.get('title')}")
+        lines.append(
+            f"分工按工作部件难度，不按比例凑点；"
+            f"预估主 AI 工作量 {plan.get('actual_share')}%"
+            f"（{plan.get('master_points')}/{plan.get('total_points')} 点，仅供参考）")
+        text = "\n".join(lines)
+        state["blocks"].append({"kind": "note", "text": text})
+        if self._is_active_chat_state(state):
+            self._render_chat_note(text)
+
+    def _on_dual_role_started(self, state, role, label):
+        if self._is_active_chat_state(state):
+            # 先把上一角色尚未刷新的文本提交，再开始新气泡。
+            self._flush_dual_stream()
+            self._dual_stream_timer.stop()
+        state["dual_last_role"] = role
+        state["dual_live"] = ""
+        if not self._is_active_chat_state(state):
+            return
+        self._discard_dual_live(state)
+        wrapper, bubble = self._add_bubble(role, "", plain=True)
+        state["dual_live_wrapper"] = wrapper
+        state["dual_live_bubble"] = bubble
+        self._on_dual_note(state, label)
+
+    def _on_dual_delta(self, state, _role, chunk):
+        state["dual_live"] = (state.get("dual_live") or "") + chunk
+        if not self._is_active_chat_state(state):
+            return
+        # 只标记有更新，由定时器批量刷新文本；高频 delta 不再逐条重排。
+        if not self._dual_stream_timer.isActive():
+            self._dual_stream_timer.start()
+
+    def _flush_dual_stream(self):
+        """把当前项目的流式文本一次性提交到气泡。"""
+        state = self._chat_state()
+        if not self._is_active_chat_state(state):
+            self._dual_stream_timer.stop()
+            return
+        text = state.get("dual_live") or ""
+        if not text:
+            self._dual_stream_timer.stop()
+            return
+        bubble = state.get("dual_live_bubble")
+        if bubble is None:
+            wrapper, bubble = self._add_bubble(
+                state.get("dual_last_role") or "assistant", "", plain=True)
+            state["dual_live_wrapper"] = wrapper
+            state["dual_live_bubble"] = bubble
+        bubble.set_plain(text)
+        self._scroll_to_bottom()
+
+    def _discard_dual_live(self, state):
+        wrapper = state.get("dual_live_wrapper")
+        if wrapper is not None:
+            wrapper.deleteLater()
+        state["dual_live_wrapper"] = None
+        state["dual_live_bubble"] = None
+        state["dual_live"] = ""
+
+    def _on_dual_message(self, state, role, text, tools):
+        stream_text = state.get("dual_live") or ""
+        if self._is_active_chat_state(state):
+            bubble = state.get("dual_live_bubble")
+            if bubble is not None:
+                if text:
+                    bubble.set_markdown(text)
+                elif stream_text:
+                    bubble.set_markdown(stream_text)
+            elif text:
+                self._add_bubble(role, text)
+        state["dual_live_wrapper"] = None
+        state["dual_live_bubble"] = None
+        state["dual_live"] = ""
+        final_text = text or stream_text
+        if final_text:
+            state["blocks"].append(
+                {"kind": role, "text": final_text})
+        for tool in tools or []:
+            block = {"kind": "tool", "name": tool.get("name", "工具"),
+                     "data": tool.get("input") or {}}
+            state["blocks"].append(block)
+            if self._is_active_chat_state(state):
+                self._render_tool_chip(block["name"], block["data"])
+        if self._is_active_chat_state(state):
+            self._scroll_to_bottom()
+
+    def _on_dual_tool(self, state, _role, name, data):
+        block = {"kind": "tool", "name": name, "data": data or {}}
+        state["blocks"].append(block)
+        if self._is_active_chat_state(state):
+            self._render_tool_chip(name, data or {})
+
+    def _on_dual_completed(self, state, info):
+        self._discard_dual_live(state)
+        if info.get("state_dir"):
+            state["dual_state_dir"] = info["state_dir"]
+        stats = info.get("stats") or {}
+        master = stats.get("master") or {}
+        worker = stats.get("worker") or {}
+
+        def call_text(item):
+            parts = [f"{item.get('calls', 0)} 次调用"]
+            cost = float(item.get("cost") or 0)
+            if cost > 0:
+                parts.append(f"${cost:.4f}")
+            tokens = int(item.get("tokens") or 0)
+            if tokens > 0:
+                parts.append(f"{tokens:,} tokens")
+            seconds = float(item.get("seconds") or 0)
+            if seconds > 0:
+                parts.append(f"{seconds:.0f} 秒")
+            return " · ".join(parts)
+
+        takeovers = sum(
+            1 for record in info.get("records") or []
+            if record.get("takeover") is not None)
+        takeover_text = f"　主 AI 接管 {takeovers} 次" if takeovers else ""
+        asks = int(info.get("asks") or 0)
+        ask_text = f"　中途询问 {asks} 次" if asks else ""
+        before = int(info.get("context_before") or 0)
+        after = int(info.get("context_after") or before)
+        context_text = (f"　上下文 {before:,}→{after:,} 字符"
+                        if after < before else "")
+
+        if info.get("cancelled"):
+            note = "协作已停止。"
+        else:
+            headline = "协作完成" if info.get("ok") else "协作结束（有未完成项）"
+            review_text = ("" if info.get("review_enabled", True)
+                           else "　复查已关闭")
+            note = (
+                f"{headline} · 档次 {info.get('tier')} · "
+                f"{info.get('tier_label') or '按工作部件分工'}"
+                f"{review_text}{takeover_text}{ask_text}{context_text}\n"
+                f"主 AI：{call_text(master)}　执行 AI：{call_text(worker)}\n"
+                f"跨模型提示 {int(info.get('prompt_chars') or 0):,} 字符"
+                f"（按档次收敛调用次数与交接长度）")
+        if info.get("state_dir"):
+            note += f"\n交接协议 v{info.get('protocol_version', 3)} · 完整记录：{info['state_dir']}"
+        state["status"] = (
+            "协作完成" if (info.get("ok") and not info.get("cancelled"))
+            else "已停止" if info.get("cancelled") else "协作结束")
+        state["blocks"].append({"kind": "note", "text": note})
+        if self._is_active_chat_state(state):
+            self._render_chat_note(note)
+            self.chat_status.setText(state["status"])
+        QTimer.singleShot(600, self._refresh_balances)
+
+    def _on_dual_failed(self, state, message):
+        self._discard_dual_live(state)
+        text = f"协作出错：{message}"
+        state["status"] = "出错"
+        state["blocks"].append({"kind": "note", "text": text})
+        if self._is_active_chat_state(state):
+            self._render_chat_note(text)
+            self.chat_status.setText("出错")
+
+    def _on_dual_thread_finished(self, state):
+        thread = state.get("dual_thread")
+        if thread is not None:
+            thread.deleteLater()
+            state["dual_thread"] = None
+        state["busy"] = False
+        if self._is_active_chat_state(state):
+            self._dual_stream_timer.stop()
+            self._update_chat_buttons()
+            self._flush_stream()
+            if self._pending_catalog is not None:
+                models, error = self._pending_catalog
+                self._pending_catalog = None
+                self._on_catalog_loaded(models, error)
+
     def _current_permission_mode(self):
         return self.perm_combo.currentData() or "default"
 
@@ -9362,6 +10294,10 @@ class MainWindow(QMainWindow):
         if not levels:
             # 服务商没有报告该模型的档位时才使用兜底
             levels = list(FALLBACK_EFFORTS)
+        pending_effort = not self._catalog_loaded and "efforts" not in meta
+        if (pending_effort and self._effort in EFFORT_CLI_LEVELS
+                and self._effort not in levels):
+            levels.append(self._effort)
         wanted = preferred or self._effort
         if wanted not in levels:
             wanted = meta.get("default_effort")
@@ -9381,7 +10317,8 @@ class MainWindow(QMainWindow):
         self.effort_combo.setToolTip(tip)
 
         effort = self.effort_combo.currentData()
-        if effort and effort != self._effort:
+        # 异步目录到达前，兜底选项不能覆盖已保存的自定义模型档位。
+        if effort and effort != self._effort and not pending_effort:
             self._effort = effort
             self.config["effort"] = effort
             save_config(self.config)
@@ -9402,8 +10339,8 @@ class MainWindow(QMainWindow):
 
     def _on_catalog_finished(self):
         self._catalog_thread = None
-        self.btn_refresh_models.setEnabled(True)
         self.btn_refresh_models.setText("↻")
+        self._update_dual_controls()
 
     def _on_catalog_loaded(self, models, error):
         if self._chat_busy:
@@ -9411,6 +10348,9 @@ class MainWindow(QMainWindow):
             self._pending_catalog = (models, error)
             return
         if error or not models:
+            # Codex 目录来自本地缓存，不依赖服务商网络请求是否成功。
+            self._populate_dual_combos()
+            self._refresh_balances()
             self.statusBar().showMessage(
                 f"模型列表获取失败，继续使用内置列表：{error}"[:180], 6000)
             return
@@ -9418,6 +10358,8 @@ class MainWindow(QMainWindow):
         self._model_catalog = {m["id"]: m for m in models}
         self._catalog_loaded = True
         self._populate_model_combo()
+        self._populate_dual_combos()
+        self._refresh_balances()
         if self._model != old_model:
             self.config["model"] = self._model
             save_config(self.config)
@@ -9467,6 +10409,8 @@ class MainWindow(QMainWindow):
         self._populate_effort_combo()
         self.worker.set_model(model, resume=self._chat_resume_id)
         self._sync_study_runtime(model=model)
+        if not self._dual_mode_on():
+            self._refresh_balance("single", force=True)
         self.statusBar().showMessage(
             f"模型：{self.model_combo.currentText()}（已应用到对话）", 3000)
 
@@ -9507,7 +10451,8 @@ class MainWindow(QMainWindow):
     def _update_chat_buttons(self):
         has_project = bool(self.current_project)
         self.btn_send.setEnabled(
-            has_project and not self._chat_busy and SDK_AVAILABLE)
+            has_project and not self._chat_busy
+            and (SDK_AVAILABLE or self._dual_mode_on()))
         self.btn_stop.setEnabled(self._chat_busy)
         self.btn_new_chat.setEnabled(has_project)
         self.btn_continue_chat.setEnabled(has_project and not self._chat_busy)
@@ -9520,6 +10465,7 @@ class MainWindow(QMainWindow):
         self.perm_combo.setEnabled(not self._chat_busy)
         self.model_combo.setEnabled(not self._chat_busy)
         self.effort_combo.setEnabled(not self._chat_busy)
+        self._update_dual_controls()
         self._update_chat_qa_buttons()
 
     def _show_empty_state(self, text):
@@ -9540,6 +10486,12 @@ class MainWindow(QMainWindow):
             self._chat_empty.hide()
 
     def _clear_chat_view(self):
+        # 使尚未执行的滚动回调失效，避免旧项目 / 旧渲染滚到新内容。
+        self._chat_render_gen += 1
+        self._chat_bulk_render = False
+        self._chat_last_wrapper = None
+        self._chat_last_user_wrapper = None
+        self._pending_chat_anchor = None
         self._stream_timer.stop()
         while self.chat_layout.count() > 1:
             item = self.chat_layout.takeAt(0)
@@ -9584,7 +10536,12 @@ class MainWindow(QMainWindow):
             row.addStretch(1)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, wrapper)
         self._hide_empty_state()
-        self._scroll_to_bottom()
+        if self._chat_bulk_render:
+            self._chat_last_wrapper = wrapper
+            if role == "user":
+                self._chat_last_user_wrapper = wrapper
+        else:
+            self._scroll_to_bottom()
         return wrapper, bubble
 
     def _append_chat_block(self, block):
@@ -9594,7 +10551,7 @@ class MainWindow(QMainWindow):
 
     def _render_chat_block(self, block):
         kind = block.get("kind")
-        if kind in ("user", "assistant"):
+        if kind in ("user", "assistant", "master", "worker"):
             self._add_bubble(
                 kind, block.get("text", ""),
                 plain=bool(block.get("plain", kind == "user")))
@@ -9608,12 +10565,32 @@ class MainWindow(QMainWindow):
         """按当前项目的记录重建对话区（切换项目或恢复时使用）。"""
         state = self._chat_state()
         self._clear_chat_view()
-        for block in state["blocks"]:
-            self._render_chat_block(block)
-        if state["live"]:
-            self._live_wrapper, self._live_bubble = self._add_bubble(
-                "assistant", "", plain=True)
-            self._live_bubble.set_plain(state["live"])
+        gen = self._chat_render_gen
+        project = self.current_project or ""
+        # 批量重建期间不逐条滚到底，否则最后一帧会停在最下面。
+        self._chat_bulk_render = True
+        self._chat_last_wrapper = None
+        self._chat_last_user_wrapper = None
+        try:
+            for block in state["blocks"]:
+                self._render_chat_block(block)
+            if state["live"]:
+                self._live_wrapper, self._live_bubble = self._add_bubble(
+                    "assistant", "", plain=True)
+                self._live_bubble.set_plain(state["live"])
+            if state.get("dual_live"):
+                role = state.get("dual_last_role") or "assistant"
+                wrapper, bubble = self._add_bubble(role, "", plain=True)
+                bubble.set_plain(state["dual_live"])
+                state["dual_live_wrapper"] = wrapper
+                state["dual_live_bubble"] = bubble
+        finally:
+            self._chat_bulk_render = False
+        target = self._chat_last_user_wrapper or self._chat_last_wrapper
+        if target is not None:
+            # 定位到最近一轮用户提问的顶部；没有用户消息时退回最后一条消息。
+            self._scroll_to_wrapper_top(
+                target, gen, project, self._chat_scroll_seq)
         if not state["blocks"] and not state["live"]:
             if state["path"]:
                 self._show_empty_state("开始新的对话吧\n在下方输入消息")
@@ -9627,7 +10604,10 @@ class MainWindow(QMainWindow):
         label.setWordWrap(True)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, label)
         self._hide_empty_state()
-        self._scroll_to_bottom()
+        if self._chat_bulk_render:
+            self._chat_last_wrapper = label
+        else:
+            self._scroll_to_bottom()
 
     def _add_chat_note(self, text):
         self._append_chat_block({"kind": "note", "text": text})
@@ -9653,15 +10633,77 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, wrapper)
         self._hide_empty_state()
-        self._scroll_to_bottom()
+        if self._chat_bulk_render:
+            self._chat_last_wrapper = wrapper
+        else:
+            self._scroll_to_bottom()
 
     def _add_tool_chip(self, name, data):
         self._append_chat_block(
             {"kind": "tool", "name": name, "data": data})
 
     def _scroll_to_bottom(self):
+        if self._chat_bulk_render:
+            return
+        self._chat_scroll_seq += 1
         bar = self.chat_scroll.verticalScrollBar()
-        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+        gen = self._chat_render_gen
+        QTimer.singleShot(0, lambda: self._apply_scroll_bottom(bar, gen, final=False))
+
+    def _apply_scroll_bottom(self, bar, gen, final=True):
+        # 渲染代次已变（切换项目 / 重建）时丢弃过期回调。
+        if gen != self._chat_render_gen:
+            return
+        bar.setValue(bar.maximum())
+        if not final:
+            # 新内容插入后布局可能再长一帧；延后校准到真正的底部。
+            QTimer.singleShot(
+                0, lambda: self._apply_scroll_bottom(bar, gen, final=True))
+
+    def _scroll_to_wrapper_top(self, wrapper, gen, project, seq):
+        """把某个气泡（最近一轮用户提问）定位到聊天视口顶部。"""
+        QTimer.singleShot(
+            0, lambda: self._apply_wrapper_top(
+                wrapper, gen, project, seq, final=False))
+
+    def _apply_pending_chat_anchor(self):
+        """切回对话页后应用此前暂存的定位。"""
+        pending = self._pending_chat_anchor
+        if pending is None:
+            return
+        wrapper, gen, project, seq = pending
+        if (gen != self._chat_render_gen
+                or project != (self.current_project or "")
+                or seq != self._chat_scroll_seq):
+            self._pending_chat_anchor = None
+            return
+        if wrapper.isHidden() or not wrapper.isVisible():
+            return
+        self._apply_wrapper_top(wrapper, gen, project, seq, final=True)
+
+    def _apply_wrapper_top(self, wrapper, gen, project, seq, final=True):
+        if gen != self._chat_render_gen or project != (self.current_project or ""):
+            return
+        # 期间用户已发送新消息 / 流式输出要滚到底时，让位给新的滚动意图。
+        if seq != self._chat_scroll_seq:
+            return
+        if wrapper is None or wrapper.isHidden():
+            return
+        if not wrapper.isVisible():
+            # 对话页不在前台（例如切到代码开发页）：等切回对话页再定位。
+            self._pending_chat_anchor = (wrapper, gen, project, seq)
+            return
+        self._pending_chat_anchor = None
+        # 先让刚插入的气泡完成布局，第二次回调再校准最终位置。
+        self.chat_layout.activate()
+        self.chat_body_widget.adjustSize()
+        bar = self.chat_scroll.verticalScrollBar()
+        y = wrapper.mapTo(self.chat_body_widget, QPoint(0, 0)).y()
+        bar.setValue(max(0, min(y, bar.maximum())))
+        if not final:
+            QTimer.singleShot(
+                0, lambda: self._apply_wrapper_top(
+                    wrapper, gen, project, seq, final=True))
 
     def _prepare_worker(self):
         mode = self._current_permission_mode()
@@ -9685,7 +10727,7 @@ class MainWindow(QMainWindow):
         if media_command is not None:
             self._handle_media_command(*media_command)
             return
-        if not SDK_AVAILABLE:
+        if not SDK_AVAILABLE and not self.dual_check.isChecked():
             QMessageBox.warning(
                 self, "缺少对话组件",
                 "未安装 Claude Agent SDK，无法在界面内对话。\n\n"
@@ -9703,8 +10745,15 @@ class MainWindow(QMainWindow):
             display = quote_display + display
             self._clear_quote()
         if self.btn_study_mode.isChecked():
+            if self.dual_check.isChecked():
+                self.statusBar().showMessage(
+                    "研读模式使用单模型；已按单模型流程发送", 3500)
             self._send_study_learning(prompt, display)
             self._clear_attachments()
+            return
+        if self.dual_check.isChecked():
+            self._study_pending = False
+            self._send_dual_message(prompt, display)
             return
         self._study_pending = False
         self._prepare_worker()
@@ -9748,7 +10797,8 @@ class MainWindow(QMainWindow):
         raw = str(target.get("text") or "").strip()
         if not raw:
             return "", ""
-        who = "你" if target.get("role") == "user" else "Claude"
+        who = {"user": "你", "master": "主 AI",
+               "worker": "执行 AI"}.get(target.get("role"), "Claude")
         snippet = " ".join(raw.split())
         if len(snippet) > 200:
             snippet = snippet[:200] + "…"
@@ -9887,23 +10937,67 @@ class MainWindow(QMainWindow):
         self._ask_chat_selection(text, role)
 
     # ------------------------------------------------------------ 进度查询 --
+    @staticmethod
+    def _dual_running_snapshot(state):
+        """双 AI 协作线程正在运行时返回它的实时快照。
+
+        协作模式不使用单模型 worker，所以必须单独采集，否则「进度查询」
+        会误报“没有运行中的任务”。
+        """
+        thread = (state or {}).get("dual_thread")
+        if thread is None:
+            return None
+        try:
+            if not thread.isRunning():
+                return None
+            snapshot = (thread.status_snapshot()
+                        if hasattr(thread, "status_snapshot") else {"busy": True})
+        except RuntimeError:
+            # QThread 已销毁
+            return None
+        snapshot = dict(snapshot or {})
+        snapshot["busy"] = True
+        return snapshot
+
     def _progress_worker_snapshot(self):
-        """优先报告正在运行的主对话；主对话空闲时报告问答窗口。"""
+        """优先报告正在运行的对话：当前项目 → 其他项目 → 问答窗口。
+
+        每个项目有独立的单模型 worker 和协作线程，任一在运行都应报告；
+        全都空闲时才回落为“无任务”。
+        """
         state = self._chat_state()
         worker = state.get("worker")
-        if worker is not None:
-            snapshot = worker.status_snapshot()
-            if snapshot.get("busy"):
-                return snapshot, "主对话"
+        worker_snapshot = worker.status_snapshot() if worker is not None else None
+
+        snapshot = self._dual_running_snapshot(state)
+        if snapshot is not None:
+            return snapshot, "主对话 · 协作"
+        if worker_snapshot is not None and worker_snapshot.get("busy"):
+            return worker_snapshot, "主对话"
+
         qa_worker = getattr(self, "_chat_qa_worker", None)
-        if qa_worker is not None:
-            qa_snapshot = qa_worker.status_snapshot()
-            if qa_snapshot.get("busy"):
-                return qa_snapshot, "问答窗口"
-        if worker is not None:
-            return worker.status_snapshot(), "主对话"
-        if qa_worker is not None:
-            return qa_worker.status_snapshot(), "问答窗口"
+        qa_snapshot = qa_worker.status_snapshot() if qa_worker is not None else None
+        if qa_snapshot is not None and qa_snapshot.get("busy"):
+            return qa_snapshot, "问答窗口"
+
+        # 后台项目仍在运行：切换项目后也应能看到真实进度。
+        for key, other in list(getattr(self, "_chat_states", {}).items()):
+            if other is state:
+                continue
+            name = os.path.basename(str(key or "").rstrip("/")) or "其他项目"
+            snapshot = self._dual_running_snapshot(other)
+            if snapshot is not None:
+                return snapshot, f"{name} · 协作"
+            other_worker = other.get("worker")
+            if other_worker is not None:
+                other_snapshot = other_worker.status_snapshot()
+                if other_snapshot.get("busy"):
+                    return other_snapshot, f"{name} · 主对话"
+
+        if worker_snapshot is not None:
+            return worker_snapshot, "主对话"
+        if qa_snapshot is not None:
+            return qa_snapshot, "问答窗口"
         return None, "主对话"
 
     def _progress_markup(self, snapshot, channel):
@@ -9989,6 +11083,17 @@ class MainWindow(QMainWindow):
             f"进度：{progress}",
             f"预计：{eta}",
         ]
+        if snapshot.get("dual"):
+            role_label = str(snapshot.get("role_label") or "")
+            task_label = str(snapshot.get("task_label") or "")
+            tier = str(snapshot.get("tier") or "")
+            parts = ([f"档次 {html.escape(tier)}"] if tier else []) + [
+                html.escape(x) for x in (role_label, task_label) if x]
+            if "review_enabled" in snapshot:
+                parts.append("复查 开" if snapshot["review_enabled"]
+                             else "复查 关")
+            if parts:
+                lines.insert(1, "协作：" + " · ".join(parts))
         if busy:
             lines.append(f"已运行：{fmt_time(elapsed)}")
             if activity:
@@ -9996,13 +11101,19 @@ class MainWindow(QMainWindow):
         lines.extend(background_monitor.render_markup(bg_snapshot))
         return "<br>".join(lines)
 
-    def _show_progress_popup(self):
+    def _progress_markup_now(self):
         snapshot, channel = self._progress_worker_snapshot()
         if snapshot is None:
-            markup = "<b>进度查询</b><br>当前没有可用的对话进程"
-        else:
-            markup = self._progress_markup(snapshot, channel)
+            # 还没创建会话进程时也给出一致的空闲状态，而不是“无可用进程”。
+            snapshot = {
+                "busy": False,
+                "permission_mode": self._current_permission_mode(),
+            }
+            channel = "主对话"
+        return self._progress_markup(snapshot, channel)
 
+    def _show_progress_popup(self):
+        markup = self._progress_markup_now()
         popup = getattr(self, "_progress_popup", None)
         if popup is None:
             popup = ProgressPopup(self)
@@ -10014,12 +11125,7 @@ class MainWindow(QMainWindow):
         popup = getattr(self, "_progress_popup", None)
         if popup is None or not popup.isVisible():
             return
-        snapshot, channel = self._progress_worker_snapshot()
-        if snapshot is None:
-            markup = "<b>进度查询</b><br>当前没有可用的对话进程"
-        else:
-            markup = self._progress_markup(snapshot, channel)
-        popup.show_for(self.btn_progress, markup)
+        popup.show_for(self.btn_progress, self._progress_markup_now())
 
     def _watch_background_tasks(self):
         """后台任务消失时主动提示，避免回合结束后用户还得反复询问。"""
@@ -11446,6 +12552,12 @@ class MainWindow(QMainWindow):
             "已允许本次操作" if allowed else "已拒绝本次操作", 3000)
 
     def _interrupt_chat(self):
+        state = self._chat_state()
+        thread = state.get("dual_thread")
+        if thread is not None and thread.isRunning():
+            thread.cancel()
+            self.chat_status.setText("正在停止协作…")
+            return
         if self._chat_busy:
             self.worker.interrupt()
             self.chat_status.setText("正在停止…")
@@ -11455,11 +12567,21 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("请先选择一个项目", 3000)
             return
         state = self._chat_state()
+        thread = state.get("dual_thread")
+        if thread is not None and thread.isRunning():
+            thread.cancel()
+            self.chat_status.setText("正在停止协作，请结束后再新建对话…")
+            return
         if state.get("worker") is not None:
             state["worker"].reset()
         state["blocks"] = []
         state["live"] = ""
+        state["dual_live"] = ""
+        state["dual_live_bubble"] = None
+        state["dual_live_wrapper"] = None
+        state["dual_last_role"] = ""
         state["status"] = "新对话"
+        state.pop("dual_state_dir", None)
         self._chat_cwd = None
         self._chat_resume_id = None
         self._chat_session_id = None
@@ -11521,6 +12643,7 @@ class MainWindow(QMainWindow):
         state["blocks"] = []
         state["live"] = ""
         state["status"] = "已恢复会话"
+        state.pop("dual_state_dir", None)
         self._chat_cwd = None
         self._chat_resume_id = sid
         self._chat_session_id = sid
@@ -11553,9 +12676,14 @@ class MainWindow(QMainWindow):
             return
         state = self._chat_state()
         self._render_chat_state()
-        self.chat_status.setText(
-            "Claude 正在回复…" if state["busy"]
-            else (state["status"] or "就绪"))
+        thread = state.get("dual_thread")
+        dual_busy = thread is not None and thread.isRunning()
+        if dual_busy:
+            self.chat_status.setText("双 AI 协作中…")
+        else:
+            self.chat_status.setText(
+                "Claude 正在回复…" if state["busy"]
+                else (state["status"] or "就绪"))
         self._update_chat_buttons()
 
     # ------------------------------------------------------------- actions --
@@ -11633,8 +12761,10 @@ class MainWindow(QMainWindow):
         try:
             for state in getattr(self, "_chat_states", {}).values():
                 worker = state.get("worker")
-                if state.get("busy") or (worker is not None
-                                         and worker.busy):
+                dual = state.get("dual_thread")
+                if (state.get("busy")
+                        or (worker is not None and worker.busy)
+                        or (dual is not None and dual.isRunning())):
                     return True
             if getattr(self, "_chat_qa_busy", False):
                 return True
@@ -11673,7 +12803,7 @@ class MainWindow(QMainWindow):
             save_config(self.config)
             workers = [getattr(self, attr, None)
                        for attr in ("_skill_worker", "_plugin_worker",
-                                    "_chat_media_worker")]
+                                    "_chat_media_worker", "_catalog_thread")]
             workers += [att.get("worker")
                         for att in getattr(self, "chat_attachments", [])
                         if att.get("worker") is not None]
@@ -11687,6 +12817,16 @@ class MainWindow(QMainWindow):
             if proc is not None and proc.state() != QProcess.NotRunning:
                 proc.terminate()
                 proc.waitForFinished(1000)
+            dual_threads = []
+            for state in getattr(self, "_chat_states", {}).values():
+                dual = state.get("dual_thread")
+                if dual is not None and dual.isRunning():
+                    dual.cancel()
+                    dual_threads.append(dual)
+            for dual in dual_threads:
+                if not dual.wait(6000):
+                    dual.terminate()
+                    dual.wait(1000)
             for state in getattr(self, "_chat_states", {}).values():
                 worker = state.get("worker")
                 if worker is not None:
@@ -11719,6 +12859,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("Claude Console")
+    app.setApplicationVersion(APP_VERSION)
     app.setApplicationDisplayName(APP_NAME)
     app.setDesktopFileName("claude-console")
     app.setStyleSheet(QSS)
